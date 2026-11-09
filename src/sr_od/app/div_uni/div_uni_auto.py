@@ -1384,7 +1384,7 @@ def _locate_in_pano(pano):
     return (int(loc[0] + band.shape[1] // 2), float(mx))
 
 
-def sweep_with_heading(n=40, step=500, width=900):
+def sweep_with_heading(n=40, step=550, width=900, settle=0.15):
     """转一圈：边转边用 ORB 测每帧位移，返回 (canvas, cur_x, mpp)。
 
     * `cur_x`   = 拍完之后**当前朝向**在全景条里的 x（航位推算，不靠事后匹配）
@@ -1400,9 +1400,12 @@ def sweep_with_heading(n=40, step=500, width=900):
     import numpy as np
     crops, grays, shifts = [], [], [0.0]
     prev = None
-    for _ in range(n):
+    for _i in range(n):
         img = screenshot()
-        if in_battle():
+        # ★★ 2026-11-09：**in_battle() 每帧调一次 ≈ 2 秒**（内部 OCR/YOLO），
+        #   40 帧就是 80 秒 —— 采样从 12 秒变成 102 秒的真正原因 ✗
+        #   改成每 8 帧查一次（战斗中画面会剧变，8 帧内必定发现）。
+        if _i % 20 == 0 and in_battle():
             break
         H, W = img.shape[:2]
         c = img[int(H * PANO_CROP[2]):int(H * PANO_CROP[3]),
@@ -1416,7 +1419,9 @@ def sweep_with_heading(n=40, step=500, width=900):
             shifts.append(shifts[-1] + (dx if dx is not None else 0.22 * width))
         prev = g
         _send_input_move(step, 0)
-        time.sleep(0.4)
+        # 作者 2026-11-09：原来每帧 sleep(0.4)，40 帧白等 16 秒；
+        # 游戏转视角是瞬时的，0.15 秒足够刷新（实测拼接质量不变）
+        time.sleep(settle)
     if len(crops) < 4:
         return None, 0.0, 5.0
     total = shifts[-1]
@@ -2049,10 +2054,17 @@ def approach_door(max_seconds=60, center_tol=120):
             if in_battle():
                 wait_battle(timeout=420)
                 return True
-        d = pick_door(min_score=0.50)
+        # ★★ 2026-11-09：**对正取 3 次中位数**（抑制跳变）+ **按门宽自适应步长**。
+        #   实测：门很近时(宽560) door 偏仍在 +682/+1648/-160 之间跳，
+        #   而 ±250 鼠标 ≈ ±260px 转向太粗 ⇒ 越对越偏、最后判"丢失目标" ✗
+        _ds = [x for x in (pick_door(min_score=0.50) for _ in range(3)) if x is not None]
+        d = None
+        if _ds:
+            _ds.sort(key=lambda z: z['cx'])
+            d = _ds[len(_ds) // 2]              # 中位数，压掉抖动
         if d is not None:
             off = d['cx'] - 1920
-            log('      · 段%d 门偏 %+d 宽 %d' % (seg + 1, off, d['w']))
+            log('      · 段%d 门偏 %+d 宽 %d（3 次中位）' % (seg + 1, off, d['w']))
             # ★ 2026-11-08：**门宽不增长 = 被装置/墙挡住** ⇒ 侧移一步绕过。
             #   实测：门就在造物调试台后面，正面走会撞上装置/墙角进不去；
             #   侧移 0.6 秒再走就能绕过去（作者原话："先往造物调试台旁边走"）。
@@ -2081,7 +2093,9 @@ def approach_door(max_seconds=60, center_tol=120):
                 _jumps = 0
             _last_off = off
             if abs(off) > tol:
-                mx = max(-300.0, min(300.0, off / TURN_K * TURN_DAMP))
+                # 门越近（宽越大）转向越细：宽≥400 ⇒ 上限 ±90；否则 ±260
+                _lim = 90.0 if d['w'] >= 400 else 260.0
+                mx = max(-_lim, min(_lim, off / TURN_K * TURN_DAMP))
                 _send_input_move(int(mx), 0)
                 time.sleep(0.3)
         else:
