@@ -2100,6 +2100,65 @@ def door_eyes_open(d, img=None):
         return False, 0
 
 
+def vlm_door_eyes(d=None, pad=0.25):
+    """用**本地视觉模型**判断门是睁眼（已解锁）还是闭眼（未解锁）。
+
+    ★ 2026-11-09 实测（这是本项目的**最佳方案**）：
+      纯几何判据（白色圆点/白色占比）在 6 张样本上完全无区分度 ✗；
+      而 qwen3-vl:8b 一眼就能判，还会给理由：
+
+        sr_door_closeup.jpg（粉圆+黑横线）→ **闭合**，理由
+          「两个圆形眼睛中间有黑色横线，符合闭合眼睛的视觉表现」✓
+        sr_approach_result.jpg（白色发光眼）→ **睁开** ✓
+        sr_verify_door_box / sr_door_rule_box → 闭合 ✓（4/4 正确）
+
+    返回 'open' / 'closed' / None（判不出或调用失败）。
+    """
+    import base64
+    import json
+    import urllib.request
+    try:
+        import cv2
+        if d is None:
+            d = find_door_pink()
+        if d is None:
+            return None
+        img = screenshot()
+        cx, cy, w, h = d['cx'], d['cy'], d['w'], d['h']
+        px, py = int(w * pad), int(h * pad)
+        x0 = max(0, cx - w // 2 - px); x1 = min(img.shape[1], cx + w // 2 + px)
+        y0 = max(0, cy - h // 2 - py); y1 = min(img.shape[0], cy + h // 2 + py)
+        crop = img[y0:y1, x0:x1]
+        if crop.size == 0:
+            return None
+        # 小门放大一点，让眼睛看得清（VLM 对细节仍敏感）
+        if crop.shape[1] < 300:
+            sc = 300.0 / crop.shape[1]
+            crop = cv2.resize(crop, None, fx=sc, fy=sc, interpolation=cv2.INTER_CUBIC)
+        ok, buf = cv2.imencode('.jpg', crop, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        if not ok:
+            return None
+        b64 = base64.b64encode(buf.tobytes()).decode()
+        prompt = ('/no_think 这是一扇粉色门上的两只眼睛。'
+                  '只回答一个词：【睁开】或【闭合】。')
+        body = json.dumps({'model': VLM_MODEL, 'prompt': prompt, 'images': [b64],
+                           'stream': False,
+                           'options': {'temperature': 0.1, 'num_predict': 30}}).encode('utf-8')
+        req = urllib.request.Request(VLM_URL, data=body,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+        ans = (data.get('response') or '').strip()
+        if '睁' in ans:
+            return 'open'
+        if '闭' in ans:
+            return 'closed'
+        return None
+    except Exception as e:
+        log('      · VLM 判门状态失败（不影响主流程）: %s' % e)
+        return None
+
+
 def walk_into_door(d, max_seconds=40):
     """门已睁眼 ⇒ **直接往里走**（不按 F、不转向、不点地面）。"""
     import random as _r
@@ -2685,6 +2744,12 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
                     return True
                 # ★ 作者要求：首扫看到门但对不上/进不去 ⇒ **本轮到此为止**，
                 #   不要接着覆盖推进（点地面乱走最浪费时间）
+                # ★ 走+F 没成功：用 VLM 判一下门是睁眼还是闭眼（1~4 秒）
+                _eyes = vlm_door_eyes(hit['data'])
+                if _eyes == 'closed':
+                    log('      · VLM 判定：门**闭眼（未解锁）** → 需要先清怪/做事件，不是走不过去')
+                elif _eyes == 'open':
+                    log('      · VLM 判定：门**已睁眼** → 却进不去，可能是距离/朝向问题')
                 log('      · 首扫门没进成 → 本轮结束（不覆盖、不乱走），下一轮重置后再扫')
                 return False
         # ⚠️ 2026-11-08 晚：顺序改回「门优先」。
