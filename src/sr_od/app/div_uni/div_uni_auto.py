@@ -1958,7 +1958,7 @@ def coverage_clear(max_seconds=90.0, rounds=2):
             click_phys(x, y, settle=0.2)
             time.sleep(1.3)
             for _ in range(2):
-                press('f', 0.55)
+                press_f_checked()
                 hit += 1
                 done, ev = _check()
                 if done:
@@ -1996,6 +1996,7 @@ def approach_door(max_seconds=60, center_tol=120):
     stall = 0
     _last_off = None
     _jumps = 0
+    _blind = 0        # 连续"门不可见"次数（用于交替左右侧移）
     tol = max(100, int(center_tol * 0.8))   # 模板抖动约 ±60，容差必须更宽
 
     # ★★ 2026-11-09：**战斗类区域先清怪，别急着找门**（门是锁的，清完才开）。
@@ -2079,12 +2080,12 @@ def approach_door(max_seconds=60, center_tol=120):
         #   DU 的随意门要 F 交互，光走过去不触发 ⇒ 铸造区卡死的直接原因 ✗
         if on_station_picker() or area_passed():
             return True
-        press('f', 0.55)
+        press_f_checked()
         if on_station_picker() or area_passed():
             log('      · 按 F 后出现选站点卡')
             return True
         for _ in range(2):
-            press('f', 0.7)
+            press_f_checked()
             if on_station_picker() or area_passed():
                 log('      · 按 F 出现选择下一站 ✓')
                 return True
@@ -2139,7 +2140,32 @@ def approach_door(max_seconds=60, center_tol=120):
                 _send_input_move(int(mx), 0)
                 time.sleep(0.3)
         else:
-            log('      · 段%d 门不可见（可能已贴近）' % (seg + 1))
+            # ★★ 2026-11-09 作者提示：**门和奇物机在一条直线上，装置挡在中间**。
+            #   所以"门突然不可见"通常不是走过头，而是被装置挡住了视野/去路。
+            #   对策：**小幅侧移绕开，再继续朝门走，反复尝试**（左右交替）。
+            _blind += 1
+            if _blind <= 8:
+                # ★ 不要每次交替（左右互相抵消）！先连续往左 4 次，再往右 4 次
+                side = 'a' if _blind <= 4 else 'd'
+                log('      · 段%d 门不可见 → 小侧移（%s 0.45s）绕开中间的装置（第%d次）'
+                    % (seg + 1, side.upper(), _blind))
+                pyautogui.keyDown(side)
+                time.sleep(0.6)
+                pyautogui.keyUp(side)
+                time.sleep(0.2)
+                # 侧移后立刻再朝门方向走一小步
+                pyautogui.keyDown('w')
+                time.sleep(0.55)
+                pyautogui.keyUp('w')
+                time.sleep(0.2)
+                press_f_checked()
+                if on_station_picker() or area_passed():
+                    return True
+            else:
+                log('      · 段%d 门不可见（侧移 8 次仍不见）→ 结束本轮' % (seg + 1))
+                break
+        if d is not None:
+            _blind = 0
     return on_station_picker() or area_passed()
 
 
@@ -2261,7 +2287,7 @@ def walk_into_door(d, max_seconds=40):
         # ★ 按 F 是**唯一可靠判据**（实测：不判门状态、走过去按 F → 1/13 过到 2/13 ✓）
         if on_station_picker() or area_passed():
             return True
-        press('f', 0.6)
+        press_f_checked()
         if on_station_picker() or area_passed():
             log('      · 按 F 后出现选站点卡 ✓')
             return True
@@ -2337,7 +2363,7 @@ def walk_door_with_technique(max_seconds=110):
         #   DU 的随意门要 F 交互，光走过去不触发；之前这版只走不按 F ⇒ 到了门边也不开 ✗
         if on_station_picker():
             return True
-        press('f', 0.7)
+        press_f_checked()
         if on_station_picker() or area_passed():
             log('      · ★ 按 F 后出现选站点卡')
             return True
@@ -2509,7 +2535,7 @@ def advance_and_clear(max_seconds=60):
                 return True
             continue
         walk(1.0)
-        press('f', 1.3)
+        press_f_checked()
         if area_passed():
             log('      · [%.0fs] 已经过门（弹出面具/站点界面）' % (time.time() - t0))
             return True
@@ -2586,7 +2612,7 @@ def roam_search(max_seconds=90):
             prev = band_of(screenshot())
             continue
         walk(0.5)
-        press('f', 1.0)                    # 门口不弹提示，边走边盲按
+        press_f_checked()
         if on_station_picker() or area_passed():
             return True
         if is_event_ui():
@@ -2749,6 +2775,43 @@ def vlm_ask(prompt, width=VLM_WIDTH, num_predict=300, timeout=VLM_TIMEOUT):
         return None
 
 
+# ★ 抽奖机黑名单：某区域次数用完后，不再打开它（作者 2026-11-09 要求）
+_ROULETTE_DONE = {}
+
+
+def press_f_checked(targets=None, settle=0.7):
+    """**按 F 之前先 OCR 交互提示，确认是我们要的目标**（作者 2026-11-09 要求）。
+
+    血泪：盲按 F 会把「造物调试台 / 抽奖机」打开（次数 0 时还会卡死在那儿）。
+    规则：
+      * 没有提示 ⇒ **不按**；
+      * 有提示但文字不在 targets 里 ⇒ **不按**，记一行日志；
+      * 命中 ⇒ 按 F。
+    返回 True = 真的按了。
+    """
+    if targets is None:
+        targets = ('随意门', '门', '开启', '进入', '调查', '交互', '启动', '继续')
+    try:
+        pr = find_prompts()
+    except Exception:
+        pr = []
+    if not pr:
+        return False
+    word = pr[0][0]
+    if not any(k in word for k in targets):
+        log('      · F 提示是「%s」，不是目标 → 不按 F' % word)
+        return False
+    press('f', settle)
+    return True
+
+
+def roulette_area_key():
+    try:
+        return (area_kind(), hud_progress())
+    except Exception:
+        return ('?', None)
+
+
 def find_label(keyword, min_score=0.45):
     """在屏幕上找**世界标签**（物体上方的文字，如「造物调试台」「维护市容」）。
 
@@ -2799,7 +2862,7 @@ def walk_to_label(keyword, max_seconds=45, tol=150):
         time.sleep(0.8)
         pyautogui.keyUp('w')
         time.sleep(0.3)
-        press('f', 0.9)
+        press_f_checked()
         time.sleep(0.8)
         # 交互成功通常会出现界面变化（弹窗/面板）
         st = detect_state(verbose=False)[0]
@@ -2875,7 +2938,7 @@ def walk_by_vlm(max_seconds=100):
         time.sleep(0.9)
         pyautogui.keyUp('w')
         time.sleep(0.25)
-        press('f', 0.7)
+        press_f_checked()
         if on_station_picker() or area_passed():
             return True
     return False
@@ -3614,6 +3677,10 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
             #   之前脚本就在这儿空点到卡死。次数为 0 要**直接关面板**。
             _rt = '|'.join(_texts(ocr_items()))
             if ('剩余次数：0' in _rt) or ('剩余次数:0' in _rt):
+                _rk = roulette_area_key()
+                if _rk not in _ROULETTE_DONE:
+                    _ROULETTE_DONE[_rk] = True
+                    log('      · 奇物大转盘：剩余次数 0 → **本区域不再打开抽奖机**（已拉黑）')
                 log('      · 奇物大转盘：剩余次数 0 → 按 ESC 退出（不行就点右上角 X）')
                 press('esc', 1.5)
                 time.sleep(1.2)
@@ -3625,6 +3692,11 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
                     log('        · 还是转盘 → 再按一次 ESC')
                     press('esc', 1.5)
                     time.sleep(1.0)
+                continue
+            if roulette_area_key() in _ROULETTE_DONE:
+                log('      · 奇物大转盘（本区域已拉黑）→ 直接 ESC 关掉')
+                press('esc', 1.3)
+                time.sleep(1.0)
                 continue
             log('      · 奇物大转盘 → 点「开始抽奖」')
             g = ocr_find('开始抽奖', tries=4, interval=1.0)
