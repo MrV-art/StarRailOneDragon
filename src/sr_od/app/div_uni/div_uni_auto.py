@@ -1953,21 +1953,28 @@ def approach_door(max_seconds=60, center_tol=120):
             # ★★ 2026-11-09 作者指定：**识别到门睁眼就直接走**（不按 F、不转向）
             _d0 = find_door_pink()
             if _d0 is not None:
-                _open, _eyes = door_eyes_open(_d0)
-                if _open:
-                    log('      · 门已睁眼（眼睛 x%d）→ 直接走进去' % _eyes)
-                    if walk_into_door(_d0, max_seconds=45):
-                        return True
-                else:
-                    log('      · 门还没睁眼（眼睛 x%d）→ 先清怪/放秘技' % _eyes)
+                # 睁眼判定仅作参考：视觉判据不可靠（实测闭眼门被判 open=True ✗），
+                # 真正的判据是"走过去按 F 能不能出选站点卡"。
+                try:
+                    _open, _eyes = door_eyes_open(_d0)
+                    log('      · 门状态(参考): open=%s eyes=%d —— 不作决策依据' % (_open, _eyes))
+                except Exception:
+                    pass
+                log('      · 看到门 → 走过去按 F（用结果判定，不猜状态）')
+                if walk_into_door(_d0, max_seconds=45):
+                    return True
             log('      · 战斗类区域(%s) → 用「对门+秘技+直走」打法' % _kind)
             if walk_door_with_technique(max_seconds=min(120.0, max(70.0, max_seconds))):
                 return True
             log('      · 该打法没成 → 退回漫游找怪')
+    # ★ 作者要求：**丢了目标就用全景**；这里 sweep=0 关掉"小幅度扫描"（它救不回来）
     if not turn_to_center_of(lambda: pick_door(min_score=0.42), name='门',
-                             tol=tol, max_iter=12, sweep=140):
-        log('      · 门没对上 → 兜底①：全景闭环')
-        if goto_by_panorama():
+                             tol=tol, max_iter=12, sweep=0):
+        log('      · 门没对上（丢失目标）→ 全景扫一次（计数 +1）')
+        r = pano_once('丢失目标')
+        if r is None:
+            return False
+        if r:
             return True
         # ★ 2026-11-09 作者指定：全景也找不到 ⇒ **随机走+重扫**，三次都不行才重置位置。
         log('      · 全景没找到目标 → 兜底②：随机走+重扫（最多 3 次）')
@@ -1991,6 +1998,14 @@ def approach_door(max_seconds=60, center_tol=120):
         time.sleep(0.55)
         pyautogui.keyUp('w')
         time.sleep(0.2)
+        # ★★ 2026-11-09：**步行段必须按 F**（作者指出"到门口为什么不开门"）。
+        #   DU 的随意门要 F 交互，光走过去不触发 ⇒ 铸造区卡死的直接原因 ✗
+        if on_station_picker() or area_passed():
+            return True
+        press('f', 0.55)
+        if on_station_picker() or area_passed():
+            log('      · 按 F 后出现选站点卡')
+            return True
         for _ in range(2):
             press('f', 0.7)
             if on_station_picker() or area_passed():
@@ -2098,6 +2113,13 @@ def walk_into_door(d, max_seconds=40):
         time.sleep(0.9)
         pyautogui.keyUp('w')
         time.sleep(0.25)
+        # ★ 按 F 是**唯一可靠判据**（实测：不判门状态、走过去按 F → 1/13 过到 2/13 ✓）
+        if on_station_picker() or area_passed():
+            return True
+        press('f', 0.6)
+        if on_station_picker() or area_passed():
+            log('      · 按 F 后出现选站点卡 ✓')
+            return True
         dd = find_door_pink()
         if dd is None:
             # 门消失通常意味着已经穿过去了；再等等看有没有选站点卡
@@ -2494,6 +2516,82 @@ def settle_exit():
     return True
 
 
+PANO_LIMIT_PER_AREA = 3        # ★ 同一区域全景次数上限（作者 2026-11-09：超过 n 次就结束）
+_PANO_COUNT = {}               # {(区域类型, HUD计数): 已用次数}
+_PANO_LIMIT_HIT = [False]      # 打到上限 → 整局结束
+
+
+def _area_key():
+    try:
+        import re as _re
+        hud = ''.join(t.strip() for t, s, _, _ in ocr_items() if s >= 0.4)
+        mm = _re.search(r'\d+\s*/\s*\d+', hud)
+        return (area_kind(), mm.group(0) if mm else '?')
+    except Exception:
+        return (area_kind(), '?')
+
+
+def pano_once(tag=''):
+    """全景扫描（带区域计数）。
+
+    * 初始扫描用一次、丢失目标用一次，**都算**；
+    * 同一区域超过 PANO_LIMIT_PER_AREA 次 ⇒ 置 _PANO_LIMIT_HIT，整局结束。
+    返回 True = 全景成功；False = 没成功（但还能继续）；None = 已到上限。
+    """
+    key = _area_key()
+    used = _PANO_COUNT.get(key, 0)
+    if used >= PANO_LIMIT_PER_AREA:
+        _PANO_LIMIT_HIT[0] = True
+        log('      !!! 本区域(%s)全景已用 %d 次（上限 %d）→ **结束本局**'
+            % (key[0] or '?', used, PANO_LIMIT_PER_AREA))
+        return None
+    _PANO_COUNT[key] = used + 1
+    log('      · 全景第 %d/%d 次（区域 %s，%s）'
+        % (used + 1, PANO_LIMIT_PER_AREA, key[0] or '?', tag))
+    try:
+        return bool(goto_by_panorama())
+    except Exception as e:
+        log('      · 全景异常: %s' % e)
+        return False
+
+
+def scan_in_place(max_steps=14, step_mouse=600):
+    """**原地转一圈扫描**（作者 2026-11-09 要求）：
+
+        「进入区域的第一次扫描如果没扫到东西就不要动，免得乱动浪费时间，
+          毕竟初始位置已经是最方便识别的了。」
+
+    做法：站在出生点（不动位置），每次只**转视角**一档，每档检测
+    ① 粉门/门模板 ② 顶部敌人标识 ③ F 提示（随意门/调查/开启…）。
+    返回 {'kind':'door'|'enemy'|'prompt', ...} 或 None（一圈都没有）。
+    """
+    log('      · 原地转一圈扫描（不动位置）')
+    for i in range(max_steps):
+        try:
+            d = find_door_pink()
+            if d is None:
+                d = find_door_by_tpl(min_score=0.42)
+            # ★★ 只认够大的门：远处 60~90px 的粉色小物件极可能是假门
+            #   （实测：偏-1820 宽200 的"门"，走近后只有 72px，根本不是门 ✗）
+            if d is not None and d['w'] >= 130:
+                log('        ✓ 第%d档扫到门（偏%+d 宽%d）' % (i, d['cx'] - 1920, d['w']))
+                return {'kind': 'door', 'data': d}
+            ind = enemy_indicator()
+            if ind is not None:
+                log('        ✓ 第%d档扫到敌人标识: %s' % (i, ind))
+                return {'kind': 'enemy', 'label': ind}
+            pr = find_prompts()
+            if pr:
+                log('        ✓ 第%d档扫到提示「%s」' % (i, pr[0][0]))
+                return {'kind': 'prompt', 'data': pr[0]}
+        except Exception as e:
+            log('        ! 扫描异常: %s' % e)
+        _send_input_move(step_mouse, 0)
+        time.sleep(0.25)
+    log('      · 原地一圈没有扫到任何目标 → **改用全景扫描**（作者 2026-11-09：丢了目标就用全景，小幅度扫描没用）')
+    return None
+
+
 def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
     """清场 + 过门。返回 True = 已出现「选择下一站」。
 
@@ -2502,6 +2600,34 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
     t_all = time.time()
     for t in range(1, tries + 1):
         log('      · 清场第 %d/%d 趟（直走 %ds）' % (t, tries, walk_seconds))
+        # ★★ 2026-11-09 作者要求：**进区域先原地转一圈**；扫不到就不动（不乱走浪费）。
+        if t == 1:
+            hit = scan_in_place()
+            if hit is None:
+                # ★ 作者要求：**目标丢失 = 用全景扫描**（不要小幅度扫、不要覆盖推进）
+                log('      · 首扫无目标 → 全景扫一次（计数 +1）')
+                r = pano_once('初始扫描')
+                if r is None:
+                    return False
+                if r:
+                    return True
+                log('      · 全景没找到/已到上限 → 本轮结束（等重置后再来）')
+                return False
+            if hit['kind'] == 'enemy':
+                if engage_battle(max_seconds=60):
+                    return True
+            elif hit['kind'] == 'prompt':
+                _w = hit['data'][0]
+                if interact_here():
+                    return True
+                log('      · 提示「%s」交互后未出站点卡，继续常规流程' % _w)
+            elif hit['kind'] == 'door':
+                if approach_door(max_seconds=max(20, walk_seconds // 2)):
+                    return True
+                # ★ 作者要求：首扫看到门但对不上/进不去 ⇒ **本轮到此为止**，
+                #   不要接着覆盖推进（点地面乱走最浪费时间）
+                log('      · 首扫门没进成 → 本轮结束（不覆盖、不乱走），下一轮重置后再扫')
+                return False
         # ⚠️ 2026-11-08 晚：顺序改回「门优先」。
         #   door9.png 真门模板命中后（0.65~0.70）能稳定对正并过门，
         #   而覆盖推进每轮白烧 80 秒且没实测成功过 ⇒ 只当兜底。
@@ -3058,6 +3184,9 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
 
     for i in range(1, max_areas + 1):
         check_pause('主循环')
+        if _PANO_LIMIT_HIT[0]:
+            log('  ⚠ 本区域全景次数已达上限 → 结束整局（返回 6）')
+            return 6
         log('')
         log('  === 第 %d 轮 ===' % i)
 
