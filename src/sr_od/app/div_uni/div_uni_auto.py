@@ -347,7 +347,7 @@ def go_to_target(cates, name, min_conf=0.35, close_frac=0.16, max_seconds=30,
         seen += 1
         if use_tech and not tech_used and frac > 0.04 and seen >= 2:
             log('      · 连续 %d 帧认到怪 → 放秘技 E' % seen)
-            press('e', 0.9)
+            use_technique()
             tech_used = True
         if abs(off) > 150:
             # ★★ 2026-11-08 实测更正：真实关系是 Δ偏 = -1.2 × mx（SendInput 正值 = 目标左移），
@@ -428,7 +428,7 @@ def charge_enemy(d, max_seconds=12.0):
     off = d['cx'] - 1920
     if abs(off) > 200:
         turn_mouse(max(-1600.0, min(1600.0, off / 1.2 * 0.9)))
-    press('e', 0.8)                  # 先放秘技（罩住怪）
+    use_technique()
     # ★ 2026-11-08：**扇形冲锋** —— 一次直冲经常撞空（怪在边沿、被柱子挡住、
     #   或我转向时它已经挪了位置）。改成 3 个方向各冲一小段：
     #   先朝当前方向，撞不到就往左/右各偏 ~40° 再冲，比"冲一次就放弃"稳得多 ✓
@@ -499,7 +499,7 @@ def engage_battle(max_seconds=45.0):
         return False
     log('      · 顶部敌人标识: %s → 开 E 秘技并扫动' % ind)
     t0 = time.time()
-    press('e', 0.9)
+    use_technique()
     step = 0
     while time.time() - t0 < max_seconds:
         if in_battle():
@@ -521,7 +521,7 @@ def engage_battle(max_seconds=45.0):
                 log('      · 敌人标识消失（可能走远/已进战斗）')
                 if in_battle():
                     return True
-            press('e', 0.7)         # 秘技可能有多次
+            # ⚠ 不再补按秘技（作者规则：只放一次）
     return in_battle()
 
 
@@ -1573,7 +1573,7 @@ def find_door_by_tpl(min_score=0.42, near=520):
 
 
 
-def find_door_pink(min_area_small=600):
+def find_door_pink(min_area_small=220):
     """用**颜色 + 黄框**找随意门。返回 dict 或 None。
 
     ★★ 2026-11-08 晚实测定案（原地识别，不移动）：
@@ -1601,12 +1601,22 @@ def find_door_pink(min_area_small=600):
     best = None
     for i in range(1, n):
         x, y, w, hh, area = st[i]
-        if area < min_area_small or hh < 40:
+        # ★ 2026-11-09 放宽下限：**街道远处的小门**在 960x540 下可能只有 ~25x30 px，
+        #   原来 area<600 / hh<40 会直接扔掉 ⇒ 整条街都"看不到门" ✗
+        if area < min_area_small or hh < 16:
             continue
-        # ★ 2026-11-08 晚：**排除超大块**。首领区左下角那滩粉红血迹
-        #   面积 157763 / 宽 2064px，曾被当成门追了 60 秒 ✗
-        if w * 4 > 900 or area > 40000:
-            continue
+        # ★ 2026-11-08 晚：排除超大块（血迹）。首领区那滩血迹 面积157763/宽2064px。
+        # ★★ 2026-11-09 放宽：**贴脸的门也很大**（作者指出「门就在前方、粉色不会变」），
+        #   原来 w>900 就扔掉 ⇒ 站到门前反而检测不到 ✗
+        #   改成：只有"又大又没门特征"才扔；有黄框/白点的大块照样收。
+        _huge = (w * 4 > 1800 or area > 150000)
+        if _huge:
+            _roi0 = small[y:y + hh, x:x + w]
+            _rh0 = cv2.cvtColor(_roi0, cv2.COLOR_BGR2HSV)
+            _yf0 = float(cv2.inRange(_rh0, (15, 90, 150), (40, 255, 255)).mean()) / 255.0
+            _wf0 = float(cv2.inRange(_rh0, (0, 0, 185), (180, 75, 255)).mean()) / 255.0
+            if _yf0 < 0.015 and _wf0 < 0.08:
+                continue
         ar = w / float(max(1, hh))
         if not (0.35 <= ar <= 2.2):
             continue
@@ -1617,7 +1627,7 @@ def find_door_pink(min_area_small=600):
         # 门的两条判据（实测二选一即可）：
         #   ① 黄框 ≥0.02（财富/铸造区的门 8.5%）
         #   ② 白色 ≥0.10（首领区那扇门白色 24%，血迹只有 3.3%、装饰 2.2%）
-        if not (yf >= 0.02 or wf >= 0.10):
+        if not (yf >= 0.015 or wf >= 0.08):
             continue
         off = (x + w / 2.0) * 4 - 1920
         score = yf * 20.0 + wf * 8.0 + min(area, 3000) / 3000.0 - abs(off) / 1200.0
@@ -1928,6 +1938,32 @@ def approach_door(max_seconds=60, center_tol=120):
     _last_off = None
     _jumps = 0
     tol = max(100, int(center_tol * 0.8))   # 模板抖动约 ±60，容差必须更宽
+
+    # ★★ 2026-11-09：**战斗类区域先清怪，别急着找门**（门是锁的，清完才开）。
+    #   且没有粉门/模板门时根本不该花时间对齐假门。
+    _kind = area_kind()
+    if _kind in BATTLE_KINDS:
+        # ★★ 2026-11-09：**战斗区一律先清怪**，不管有没有看到门 ——
+        #   门是锁的，清完才开（作者：「不打怪你门开不了」）。
+        #   之前加了 "看到门就跳过清怪" 的条件 ⇒ 检测到假门就直接去撞门，白跑 60 秒 ✗
+        _has_door = False
+        if not _has_door:
+            # ★★ 作者 2026-11-09 的打法：**识别门 → 放秘技 → 朝门方向一直走**，
+            #   战斗结束视角自动面对敌人（=门的方向），不走过头就不用重新找门。
+            # ★★ 2026-11-09 作者指定：**识别到门睁眼就直接走**（不按 F、不转向）
+            _d0 = find_door_pink()
+            if _d0 is not None:
+                _open, _eyes = door_eyes_open(_d0)
+                if _open:
+                    log('      · 门已睁眼（眼睛 x%d）→ 直接走进去' % _eyes)
+                    if walk_into_door(_d0, max_seconds=45):
+                        return True
+                else:
+                    log('      · 门还没睁眼（眼睛 x%d）→ 先清怪/放秘技' % _eyes)
+            log('      · 战斗类区域(%s) → 用「对门+秘技+直走」打法' % _kind)
+            if walk_door_with_technique(max_seconds=min(120.0, max(70.0, max_seconds))):
+                return True
+            log('      · 该打法没成 → 退回漫游找怪')
     if not turn_to_center_of(lambda: pick_door(min_score=0.42), name='门',
                              tol=tol, max_iter=12, sweep=140):
         log('      · 门没对上 → 兜底①：全景闭环')
@@ -2003,6 +2039,200 @@ def approach_door(max_seconds=60, center_tol=120):
         else:
             log('      · 段%d 门不可见（可能已贴近）' % (seg + 1))
     return on_station_picker() or area_passed()
+
+
+BATTLE_KINDS = ('战斗', '精英', '首领')
+
+
+def door_eyes_open(d, img=None):
+    """判断这扇门是否**已睁眼（解锁）**——作者 2026-11-09 指定：
+    「以后识别到门睁眼就直接走」。
+
+    做法：取门框内的区域，数**亮白色圆点**（眼睛）。≥2 个就认为睁眼。
+    返回 (bool, eyes_count)。
+    """
+    import cv2
+    import numpy as np
+    try:
+        if img is None:
+            img = screenshot()
+        H, W = img.shape[:2]
+        sx, sy = W / 960.0, H / 540.0
+        x0 = int((d['cx'] - d['w'] / 2) / (W / 960.0))
+        x1 = int((d['cx'] + d['w'] / 2) / (W / 960.0))
+        y0 = int((d['cy'] - d['h'] / 2) / (H / 540.0))
+        y1 = int((d['cy'] + d['h'] / 2) / (H / 540.0))
+        small = cv2.resize(img, (960, 540), interpolation=cv2.INTER_AREA)
+        roi = small[max(0, y0):min(540, y1), max(0, x0):min(960, x1)]
+        if roi.size == 0:
+            return False, 0
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        white = cv2.inRange(hsv, (0, 0, 200), (180, 60, 255))
+        white = cv2.morphologyEx(white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, _l, st, _c = cv2.connectedComponentsWithStats(white, 8)
+        eyes = 0
+        for i in range(1, n):
+            _x, _y, w, h, area = st[i]
+            if area < 8 or w < 2 or h < 2:
+                continue
+            if 0.4 <= w / float(max(1, h)) <= 2.5:
+                eyes += 1
+        return eyes >= 2, eyes
+    except Exception:
+        return False, 0
+
+
+def walk_into_door(d, max_seconds=40):
+    """门已睁眼 ⇒ **直接往里走**（不按 F、不转向、不点地面）。"""
+    import random as _r
+    t0 = time.time()
+    log('      · 门已睁眼 → 直接走进去')
+    while time.time() - t0 < max_seconds:
+        if on_station_picker() or area_passed():
+            return True
+        if in_battle():
+            wait_battle(timeout=420)
+            return True
+        pyautogui.keyDown('w')
+        time.sleep(0.9)
+        pyautogui.keyUp('w')
+        time.sleep(0.25)
+        dd = find_door_pink()
+        if dd is None:
+            # 门消失通常意味着已经穿过去了；再等等看有没有选站点卡
+            time.sleep(0.8)
+            if on_station_picker() or area_passed():
+                return True
+            if dd is None and time.time() - t0 > 6:
+                log('      · 门已在视野里消失，继续前进一小段')
+        # 只做小幅修正，绝不转身找门
+        elif abs(dd['cx'] - 1920) > 600:
+            mx = int(max(-100.0, min(100.0, (dd['cx'] - 1920) / TURN_K * TURN_DAMP)))
+            if mx:
+                _send_input_move(mx, 0)
+                time.sleep(0.25)
+    return on_station_picker()
+
+
+def walk_door_with_technique(max_seconds=110):
+    """战斗区打法（**作者 2026-11-09 指定**）：
+
+        1. 先识别门（粉色门板 + 白眼睛），把朝向对准门；
+        2. 按 E 放秘技（秘技圈跟着角色）；
+        3. **朝门的方向一直走**，沿路秘技圈会罩住敌人；
+        4. 进战斗 → 打完 → **视角自动面对敌人，而敌人和门同方向** ⇒ 继续同方向走；
+        5. 只要不走过头，就不需要重新找门（不左键点地面、不 360° 转）。
+
+    返回 True = 已出现「选择下一站」。
+    """
+    import random
+    # ① 先找门并对朝向
+    d = find_door_pink()
+    if d is None:
+        try:
+            d = find_door_by_tpl(min_score=0.42)
+        except Exception:
+            d = None
+    if d is not None:
+        off = d['cx'] - 1920
+        if abs(off) > 120:
+            mx = int(max(-300.0, min(300.0, off / TURN_K * TURN_DAMP)))
+            if mx:
+                log('      · 先对门：偏%+d → 转%+d' % (off, mx))
+                _send_input_move(mx, 0)
+                time.sleep(0.4)
+    else:
+        log('      · 没看到门（战斗区常见）→ 直接开秘技往前走')
+
+    # ② 开秘技
+    log('      · 放秘技（E）')
+    use_technique()
+
+    t0 = time.time()
+    step = 0
+    while time.time() - t0 < max_seconds:
+        if on_station_picker() or area_passed():
+            return True
+        if in_battle():
+            log('      · ★ 进战斗 → 打完继续同方向走（视角会自动面对敌人=门的方向）')
+            wait_battle(timeout=420)
+            time.sleep(1.0)
+            use_technique()
+            # 战后**不转视角**，继续往前（按作者的说法方向是一致的）
+            continue
+        step += 1
+        pyautogui.keyDown('w')
+        time.sleep(random.uniform(0.85, 1.05))
+        pyautogui.keyUp('w')
+        time.sleep(0.25)
+        # ★★ 2026-11-09（作者指出「到门口为什么不开门」）：**必须按 F**。
+        #   DU 的随意门要 F 交互，光走过去不触发；之前这版只走不按 F ⇒ 到了门边也不开 ✗
+        if on_station_picker():
+            return True
+        press('f', 0.7)
+        if on_station_picker() or area_passed():
+            log('      · ★ 按 F 后出现选站点卡')
+            return True
+        # ★ 作者硬规则：**秘技只放一次**，这里不再补按任何 E。
+        #   没打到怪就交给上层报告（NEED_AUTHOR），不要偷偷多放秘技。
+        # 只在"门还在视野里且明显偏"时才微调，且只小角度
+        if step % 3 == 0:
+            dd = find_door_pink()
+            if dd is not None:
+                o = dd['cx'] - 1920
+                if abs(o) > 420:
+                    mx = int(max(-160.0, min(160.0, o / TURN_K * TURN_DAMP)))
+                    if mx:
+                        log('      · 微调朝向 %+d（偏%+d 宽%d）' % (mx, o, dd['w']))
+                        _send_input_move(mx, 0)
+                        time.sleep(0.3)
+    log('      · 秘技+直走 %.0fs 没开出站点卡' % max_seconds)
+    return False
+
+
+def hunt_enemies(max_seconds=100):
+    """战斗/精英/首领区：**直接开秘技(E) + 往前走**，直到圈罩住敌人进战斗。
+
+    ★ 2026-11-09 作者原话（这才是正确做法，之前把它想复杂了）：
+        「战斗的房间直接开秘技，然后往前走，直到覆盖到敌人就行啦」
+        「左上角不是写着第一位面-战斗嘛，那脚本应该知道要先找敌人啊」
+
+    ⇒ 不需要等顶部敌人标识、不需要先找门：
+      1. 先按 E 开秘技（秘技圈跟着角色走）；
+      2. 一直往前走（+小幅转向，扫得更宽）；
+      3. 隔几步再按一次 E（秘技可能有多段/冷却）；
+      4. 进战斗就交给 wait_battle。
+    """
+    import random
+    t0 = time.time()
+    step = 0
+    # ★★ 2026-11-09 作者硬规则：**只放一次秘技**。
+    #   没打到怪 ⇒ 说明没覆盖到怪 ⇒ 停下来找作者（不再补按、不再乱走）。
+    log('      · 战斗区：**放一次秘技(E)** → 往前走覆盖敌人')
+    use_technique()
+    while time.time() - t0 < max_seconds:
+        if on_station_picker() or area_passed():
+            return True
+        if in_battle():
+            log('      · ★ 秘技命中 → 进战斗')
+            wait_battle(timeout=420)
+            return True
+        step += 1
+        pyautogui.keyDown('w')
+        time.sleep(random.uniform(0.9, 1.2))
+        pyautogui.keyUp('w')
+        # 小幅转向：让覆盖范围扫过左右，不要原地转圈
+        _send_input_move(random.choice((-900, -450, 450, 900)), 0)
+        time.sleep(0.3)
+        # ⚠ 不再补按秘技（作者规则：只放一次）
+        # 顺带看一眼标识：有就直接开打
+        if step % 3 == 0 and enemy_indicator() is not None:
+            log('      · 看到敌人标识 → 提前开打')
+            if engage_battle(max_seconds=45):
+                return True
+    log('      · 秘技+前走 %.0fs 没进战斗' % max_seconds)
+    log('      !!! NEED_AUTHOR: 秘技已放完但没覆盖到怪（作者规则：这种情况直接找作者）')
+    return False
 
 
 def random_walk_rescan(tries=3):
@@ -2415,6 +2645,36 @@ def leave_and_rejoin(h):
     return True
 
 
+_E_USED = [None]      # 记录"上一次放秘技时所在的区域"
+
+
+def reset_technique_flag():
+    """进入新区域/新一趟时调用：允许再放一次秘技。"""
+    _E_USED[0] = None
+
+
+def use_technique():
+    """放秘技——**作者 2026-11-09 硬规则：同一区域只放一次**。
+
+    「以后战斗或者精英或者首领场景只放一次秘技，没打到怪只能说明没覆盖到怪物，直接联系我」
+
+    ⚠ 之前代码里有 7 处 press('e')，包括「战斗后再放一次」⇒ 白耗秘技点 ✗
+    现在统一走这里：同一区域第二次调用直接拒绝。
+    返回 True = 真的按了；False = 本区域已用过，跳过。
+    """
+    try:
+        key = (area_kind(), on_station_picker())
+    except Exception:
+        key = ('?', False)
+    if _E_USED[0] == key:
+        log('      · 本区域秘技已放过一次（作者规则）→ 不再重复放')
+        return False
+    _E_USED[0] = key
+    log('      · 放秘技（E）— 本区域仅此一次')
+    use_technique()
+    return True
+
+
 def in_div_uni_area(items=None):
     """是否真的在差分宇宙的区域里。
 
@@ -2578,7 +2838,7 @@ def do_area_action(kind_hint=''):
     多试无害 ✓（商店/空白区没东西时这些操作不产生副作用 ✓）。
     """
     log('      · 秘技 + 前进')
-    press('e', 0.8)
+    use_technique()
     walk(0.7)
     walk(0.6)
 
@@ -2607,6 +2867,7 @@ def walk_to_door_and_enter(h):
 
 
 def pick_station():
+    reset_technique_flag()      # 新区域：允许再放一次秘技
     """「选择站点卡」：按**实际耗时**挑最省事的区域，再点「确定」。
 
     ★ 2026-11-08 重写。上一版只认标题『选择一张站点卡』✗，实测这一屏的标题是
