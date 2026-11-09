@@ -1519,7 +1519,9 @@ def goto_by_panorama(n=40, step=500, max_iter=12):
 DOOR_TEMPLATES = ('door9.png', 'door_casting.png')
 
 
-def find_door_by_tpl(min_score=0.42, near=520):
+def find_door_by_tpl(min_score=0.55, near=520):
+    # ★★ 2026-11-09：阈值 0.42 → 0.55。
+    #   实测真门 0.65~0.70；0.42 会把青色栅栏/装饰误认成门（铸造区实测偏+594 宽120 的假门）✗
     """用**真门模板组**多尺度匹配找门，带时间一致性。
 
     返回 {'score','cx','cy','w','h','src'} 或 None。
@@ -1673,7 +1675,7 @@ def pick_door(min_score=0.60, tol_near=420):
         if _d is not None:
             return _d
 
-    _td = find_door_by_tpl(min_score=0.42)
+    _td = find_door_by_tpl(min_score=0.55)
     if _td is not None:
         _d = _accept(_td)
         if _d is not None:
@@ -1968,7 +1970,7 @@ def approach_door(max_seconds=60, center_tol=120):
                 return True
             log('      · 该打法没成 → 退回漫游找怪')
     # ★ 作者要求：**丢了目标就用全景**；这里 sweep=0 关掉"小幅度扫描"（它救不回来）
-    if not turn_to_center_of(lambda: pick_door(min_score=0.42), name='门',
+    if not turn_to_center_of(lambda: pick_door(min_score=0.55), name='门',
                              tol=tol, max_iter=12, sweep=0):
         log('      · 门没对上（丢失目标）→ 全景扫一次（计数 +1）')
         r = pano_once('丢失目标')
@@ -2017,7 +2019,7 @@ def approach_door(max_seconds=60, center_tol=120):
             if in_battle():
                 wait_battle(timeout=420)
                 return True
-        d = pick_door(min_score=0.35)
+        d = pick_door(min_score=0.50)
         if d is not None:
             off = d['cx'] - 1920
             log('      · 段%d 门偏 %+d 宽 %d' % (seg + 1, off, d['w']))
@@ -2153,7 +2155,7 @@ def walk_door_with_technique(max_seconds=110):
     d = find_door_pink()
     if d is None:
         try:
-            d = find_door_by_tpl(min_score=0.42)
+            d = find_door_by_tpl(min_score=0.55)
         except Exception:
             d = None
     if d is not None:
@@ -2281,7 +2283,7 @@ def random_walk_rescan(tries=3):
         # 重新扫描：门（颜色/模板/YOLO）或敌人标识都算"找到目标"
         if find_door_pink() is not None:
             log('        ✓ 扫到粉门'); return True
-        if find_door_by_tpl(min_score=0.42) is not None:
+        if find_door_by_tpl(min_score=0.55) is not None:
             log('        ✓ 扫到门模板'); return True
         if enemy_indicator() is not None:
             log('        ✓ 扫到敌人标识 → 开打'); engage_battle()
@@ -2555,6 +2557,55 @@ def pano_once(tag=''):
         return False
 
 
+VLM_MODEL = 'qwen3-vl:8b'
+VLM_URL = 'http://127.0.0.1:11434/api/generate'
+VLM_WIDTH = 800            # 图像缩到 800 宽（实测精度够、速度最快）
+VLM_TIMEOUT = 90
+
+
+def vlm_ask(prompt, width=VLM_WIDTH, num_predict=300, timeout=VLM_TIMEOUT):
+    """问本地视觉模型（qwen3-vl:8b）——**决策层**用，不进伺服循环。
+
+    实测要点（2026-11-09）：
+      * 提示词必须带 `/no_think`：否则先想几百 token，单帧 27 秒；
+        加了之后 **2.3 秒** ✓
+      * `think:false` 参数无效（这版 ollama 返回空）
+      * 图像缩到 800 宽即可
+      * **坐标别信它**：实测把中央的粉门说成右侧；
+        它擅长"这是什么/能交互吗/该干什么"，不是像素定位
+
+    返回回答文本；任何失败返回 None（不抛异常）。
+    """
+    import base64
+    import json
+    import urllib.request
+    try:
+        import cv2
+        img = screenshot()
+        h = int(img.shape[0] * width / float(img.shape[1]))
+        small = cv2.resize(img, (width, h), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode('.jpg', small, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+        if not ok:
+            return None
+        b64 = base64.b64encode(buf.tobytes()).decode()
+        body = json.dumps({
+            'model': VLM_MODEL,
+            'prompt': '/no_think ' + prompt,
+            'images': [b64],
+            'stream': False,
+            'options': {'temperature': 0.1, 'num_predict': num_predict},
+        }).encode('utf-8')
+        req = urllib.request.Request(VLM_URL, data=body,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+        ans = (data.get('response') or '').strip()
+        return ans or None
+    except Exception as e:
+        log('      · VLM 调用失败（不影响主流程）: %s' % e)
+        return None
+
+
 def scan_in_place(max_steps=14, step_mouse=600):
     """**原地转一圈扫描**（作者 2026-11-09 要求）：
 
@@ -2570,7 +2621,7 @@ def scan_in_place(max_steps=14, step_mouse=600):
         try:
             d = find_door_pink()
             if d is None:
-                d = find_door_by_tpl(min_score=0.42)
+                d = find_door_by_tpl(min_score=0.55)
             # ★★ 只认够大的门：远处 60~90px 的粉色小物件极可能是假门
             #   （实测：偏-1820 宽200 的"门"，走近后只有 72px，根本不是门 ✗）
             if d is not None and d['w'] >= 130:
@@ -2611,6 +2662,14 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
                     return False
                 if r:
                     return True
+                # 全景也没找到：问本地视觉模型（决策层，2~3 秒）
+                _ans = vlm_ask('这是《崩坏：星穹铁道》差分宇宙的截图。'
+                               '用一句话回答：画面里有哪些可以交互的物体或装置？'
+                               '有没有一扇门？如果有，在左边、中间还是右边？')
+                if _ans:
+                    log('      · VLM 判断: %s' % _ans.replace(chr(10), ' ')[:220])
+                else:
+                    log('      · VLM 没有给出回答')
                 log('      · 全景没找到/已到上限 → 本轮结束（等重置后再来）')
                 return False
             if hit['kind'] == 'enemy':
