@@ -1644,7 +1644,8 @@ def find_door_by_tpl(min_score=0.55, near=520, fast=False):
     # ---- 一级：原始模板 ----
     _lw = _TPL_LAST.get('w') or 0
     if fast and _lw >= 60:
-        _scales = tuple(int(max(60, min(420, _lw * f))) for f in (0.85, 1.0, 1.2))
+        # 除了"上次门宽"附近，再带上两个远端尺度，避免门忽然变大/变小就搜不到
+        _scales = tuple(int(max(60, min(460, _lw * f))) for f in (0.6, 0.85, 1.0, 1.25, 1.7))
     else:
         _scales = (90, 130, 175, 230, 300, 380)
     for tg, tname in tg_list:
@@ -1754,7 +1755,7 @@ def find_door_pink(min_area_small=220):
 
 
 
-def pick_door(min_score=0.60, tol_near=420):
+def pick_door(min_score=0.60, tol_near=420, fast=False):
     """挑一扇门：**先用 YOLO**（专训类目），模板匹配兜底。
 
     ★ 2026-11-08：为什么改成 YOLO 优先 ——
@@ -1783,7 +1784,8 @@ def pick_door(min_score=0.60, tol_near=420):
     #   原因：财富区的**品红广告牌/海报**在颜色上与门几乎一样（都品红+黄框），
     #   颜色判据必然误检；而 door_wealth.png 自匹配 1.000、在场景里 0.6+，
     #   模板能把门和海报干净分开 ✓
-    _td = find_door_by_tpl(min_score=0.55)
+    # ★ 2026-11-09：透传 fast（原来写死 0.55 且不传 fast ⇒ 伺服的快速通道拿不到门 ✗）
+    _td = find_door_by_tpl(min_score=max(0.55, min_score), fast=fast)
     if _td is not None:
         _d = _accept(_td)
         if _d is not None:
@@ -2368,7 +2370,8 @@ def measure_turn_gain(force=False):
         return _TURN_GAIN['g']
     off2 = d2['cx'] - 1920
     g = (off2 - off1) / float(probe)
-    if g == 0 or abs(g) < 0.05:
+    g = abs(g)                     # ★ 只用幅度；方向由下面的符号公式决定
+    if g == 0 or g < 0.05:
         g = 0.42
     _TURN_GAIN['g'] = g
     log('      · 转向增益实测: %.3f px/鼠标（发%+d → 偏%+d→%+d）'
@@ -2394,7 +2397,12 @@ def servo_center_door(tol=60, max_iter=10):
         if abs(off) <= tol:
             log('      · 已居中（偏%+d，第%d次）' % (off, i + 1))
             return True, off
-        mx = -off / g * 0.9            # ★ 用实测增益换算，别再写死
+        # ★★★ 2026-11-09 **符号修正（关键）**：
+        #   鼠标右移(+m) → 画面物体**左移** ⇒ 物体偏移 off 与所需鼠标 m 的关系是
+        #       off + (-g*m) = 0   ⇒   m = off / g
+        #   之前写成 -off/g ⇒ **转反了**：门在左(-506)却往右转，越转越远，
+        #   日志「偏-506 → -708 → -908」就是铁证 ✗（这也解释了"从门边擦肩而过"）
+        mx = off / g * 0.9
         mx = int(max(-900, min(900, mx)))
         if mx == 0:
             mx = 1 if off < 0 else -1
@@ -2456,7 +2464,16 @@ def approach_door_servo(max_seconds=90, tol=40, step_sec=0.45, min_score=0.55):
 
         d = None
         try:
-            d = find_door_by_tpl(min_score=min_score, fast=True)
+            # ★★ 2026-11-09：**和扫描用同一个检测器**（pick_door），否则扫描靠 YOLO
+            #   找到的门，伺服（纯模板）每帧都认不到 → 日志"这一帧没看到门"×N ✗
+            # ★★★ 2026-11-09 **根因修复**：伺服必须**和扫描用完全相同的检测顺序**。
+            #   扫描是：find_door_pink() → find_door_by_tpl()；
+            #   伺服之前用 pick_door（模板→YOLO→detect_door_cands），
+            #   于是"扫描靠 find_door_pink 找到、宽 880 的门"，pick_door 根本不做这个检测
+            #   ⇒ 每帧都"没看到门" ✗（这个不一致白烧了好几个小时）
+            d = find_door_pink()
+            if d is None:
+                d = find_door_by_tpl(min_score=min_score)
         except Exception:
             d = None
 
@@ -2484,6 +2501,22 @@ def approach_door_servo(max_seconds=90, tol=40, step_sec=0.45, min_score=0.55):
         w = d['w']
         last_off = off
 
+        # ★★ 2026-11-09：**宽度上限**。实测门宽 1116 时那不是门而是整面墙，
+        #   而且偏移在 -1070~+116 之间乱跳（每帧锁到不同的大色块）✗
+        #   规则：宽度 > 760 ⇒ 要么已经在门口（先按 F 试），要么是墙（忽略）。
+        if w > 760:
+            log('      · 检测到超宽色块（宽%d，偏%+d）⇒ 可能是墙，先试一次 F' % (w, off))
+            if press_f_checked():
+                time.sleep(1.2)
+                if on_station_picker() or area_passed():
+                    return True
+            # 按 F 没反应 ⇒ 当这帧没有门，走一小步换视角
+            pyautogui.keyDown('w')
+            time.sleep(0.4)
+            pyautogui.keyUp('w')
+            time.sleep(0.1)
+            continue
+
         # ── 判断"被挡住"：已经对准了但门宽连续不涨 ──
         if abs(off) <= tol:
             if last_w and w <= last_w * 1.03:
@@ -2508,8 +2541,9 @@ def approach_door_servo(max_seconds=90, tol=40, step_sec=0.45, min_score=0.55):
 
         # ── 不在正中心 ⇒ **只转，不走**（作者要求）──
         if abs(off) > tol:
-            _g = _TURN_GAIN['g'] or 0.42
-            mx = int(max(-300.0, min(300.0, -off / _g * 0.9)))
+            _g = abs(_TURN_GAIN['g'] or 0.42)
+            # ★ 同上：m = off / g（不是 -off/g）
+            mx = int(max(-300.0, min(300.0, off / _g * 0.9)))
             if mx == 0:
                 mx = 1 if off < 0 else -1
             log('      · 第%d步 偏%+d（>±%d，不在正中心）→ 只转%+d' % (steps, off, tol, mx))
@@ -3189,6 +3223,19 @@ _ROULETTE_DONE = {}
 # ★ 2026-11-09 作者第二张图：一个区域里可能有 **多个可交互物（B/D/F）**，
 #   必须**逐个交互完**门才会开 ⇒ 需要 OCR/VLM 来「定位」它们在左/中/右，
 #   然后一个个走过去交互。大体方向都在出生的正前方。
+# ★ F 交互的**白名单**：门类 + 可交互物 + 常见通用动词。
+#   ⚠ 2026-11-09 血泪：之前白名单只有门类词，结果「造物调试台」弹提示时被自己拒绝，
+#     装置就在眼前却永远不按 F ✗（作者规则的本意是"别乱按到抽奖机"，不是"别交互"）
+F_ALLOW_WORDS = (
+    # 门 / 出口
+    '随意门', '门', '开启', '进入', '启动', '继续', '前往',
+    # 通用交互
+    '调查', '交互', '对话', '交谈', '查看', '拾取', '领取', '确认', '开启',
+    # 可交互物（同 INTERACT_LABELS）
+    '造物调试台', '调试台', '维护市容', '造物', '奇物', '事件',
+    '宝藏', '宝箱', '商店', '复活', '委托', '终端', '机关', '开关', '祭坛',
+)
+
 INTERACT_LABELS = (
     '造物调试台', '维护市容', '造物', '奇物', '事件', '宝藏', '宝箱',
     '商店', '复活', '委托', '调查', '终端', '机关', '开关', '祭坛', '调试台',
@@ -3206,7 +3253,7 @@ def press_f_checked(targets=None, settle=0.7):
     返回 True = 真的按了。
     """
     if targets is None:
-        targets = ('随意门', '门', '开启', '进入', '调查', '交互', '启动', '继续')
+        targets = F_ALLOW_WORDS
     try:
         pr = find_prompts()
     except Exception:
@@ -3215,7 +3262,7 @@ def press_f_checked(targets=None, settle=0.7):
         return False
     word = pr[0][0]
     if not any(k in word for k in targets):
-        log('      · F 提示是「%s」，不是目标 → 不按 F' % word)
+        log('      · F 提示是「%s」，不在白名单 → 不按 F（防误触抽奖机等）' % word)
         return False
     press('f', settle)
     return True
@@ -3465,6 +3512,7 @@ def walk_lane_to_door(max_seconds=240, step=1.2):
         return _cv.resize(g, (64, 36), interpolation=_cv.INTER_AREA).astype('float32')
 
     log('      · 直巷推进开始（A→B→C，按住 W 一直向前）')
+    _done_labels = {}          # 标签文字 -> 时间戳（交互过就 30 秒内不再理它）
     while time.time() - t0 < max_seconds:
         check_pause('直巷推进')
         stepn += 1
@@ -3513,6 +3561,7 @@ def walk_lane_to_door(max_seconds=240, step=1.2):
         if _pr:
             log('      · 看到提示「%s」→ 交互' % _pr[0][0])
             if press_f_checked():
+                _done_labels[_pr[0][0].strip()] = time.time()   # ★ 记下来，30 秒内不再理
                 time.sleep(1.3)
                 continue
 
@@ -3528,17 +3577,21 @@ def walk_lane_to_door(max_seconds=240, step=1.2):
             _lab = None
         if _lab is not None:
             _lx, _ly, _ltxt = _lab
-            _loff = _lx - 1920
-            if abs(_loff) > 160:
-                _mx2 = int(max(-260.0, min(260.0, _loff / 1.2)))
-                if _mx2:
-                    log('      · 定位到可交互「%s」偏%+d → 转%+d' % (_ltxt.strip(), _loff, _mx2))
-                    _send_input_move(_mx2, 0)
-                    time.sleep(0.3)
-                    continue
-            log('      · 可交互「%s」已对准 → 走过去' % _ltxt.strip())
-            _hold('w', 1.0)
-            continue
+            _key = _ltxt.strip()
+            if _key in _done_labels and time.time() - _done_labels[_key] < 30:
+                _lab = None
+            if _lab is not None:
+                _loff = _lx - 1920
+                if abs(_loff) > 160:
+                    _mx2 = int(max(-260.0, min(260.0, _loff / 1.2)))
+                    if _mx2:
+                        log('      · 定位到可交互「%s」偏%+d → 转%+d' % (_key, _loff, _mx2))
+                        _send_input_move(_mx2, 0)
+                        time.sleep(0.3)
+                        continue
+                log('      · 可交互「%s」已对准 → 走过去' % _key)
+                _hold('w', 1.0)
+                continue
 
         # ── 门够近 → 对准走过去 ──
         _d = None
