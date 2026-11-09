@@ -1549,18 +1549,27 @@ def goto_by_panorama(n=40, step=500, max_iter=12):
         time.sleep(0.45)
         cur_x += mouse / mpp
         log('      · 转 %+d（剩 %.0f px）' % (mouse, door['x'] - cur_x))
-    for seg in range(10):
+    for seg in range(14):
         if on_station_picker() or area_passed():
             return True
         if in_battle():
             wait_battle(timeout=420)
             return True
+        # ★★ 2026-11-09：**出生点前有栏杆**，直走会被挡住 ⇒ 每 3 段侧移一次绕开。
+        #   （实测对准门后走 10 秒仍进不去，就是被栏杆卡住）
+        if seg % 3 == 2:
+            _side = 'a' if (seg // 3) % 2 == 0 else 'd'
+            log('      · 第%d段：侧移 %s 绕栏杆/障碍' % (seg + 1, _side.upper()))
+            pyautogui.keyDown(_side)
+            time.sleep(0.55)
+            pyautogui.keyUp(_side)
+            time.sleep(0.2)
         pyautogui.keyDown('w')
         time.sleep(1.0)
         pyautogui.keyUp('w')
         time.sleep(0.2)
         for _ in range(2):
-            press('f', 0.8)
+            press_f_checked()
             if on_station_picker() or area_passed():
                 log('      · 全景兜底过门成功 ✓')
                 return True
@@ -1579,9 +1588,14 @@ DOOR_TEMPLATES = ('door9.png', 'door_casting.png', 'door_wealth.png')
 
 
 def find_door_by_tpl(min_score=0.55, near=520):
-    # ★★ 2026-11-09：阈值 0.42 → 0.55。
-    #   实测真门 0.65~0.70；0.42 会把青色栅栏/装饰误认成门（铸造区实测偏+594 宽120 的假门）✗
-    """用**真门模板组**多尺度匹配找门，带时间一致性。
+    """用**门模板组**多尺度匹配找门，带时间一致性。
+
+    ★ 2026-11-09 两处关键设计：
+      1. **两级匹配**（性能）：先只跑原始模板（6 个尺度，~800ms）；
+         低于 min_score 时，才补跑"姿态变体"（水平压缩 0.93/0.85，2 个尺度）。
+         一上来就跑全部变体会慢 3 倍（实测 2436ms）⇒ 会吃掉对正预算 ✗
+      2. **姿态容忍**（鲁棒）：模板正对 0.82、侧 20° 掉到 0.37~0.55；
+         侧看主要表现是水平压缩（cos20°≈0.94）⇒ 压缩变体正好补这个缺口。
 
     返回 {'score','cx','cy','w','h','src'} 或 None。
     """
@@ -1590,14 +1604,11 @@ def find_door_by_tpl(min_score=0.55, near=520):
     img = screenshot()
     g = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (1920, 1080), interpolation=cv2.INTER_AREA)
     hits = []
-    for tname in DOOR_TEMPLATES:
-        tpl0 = cv2.imread(os.path.join(TPL_DIR, tname))
-        if tpl0 is None:
-            continue
-        tg0 = cv2.cvtColor(tpl0, cv2.COLOR_BGR2GRAY)
-        for tw in (60, 80, 105, 135, 175, 230, 300, 380):
+
+    def _scan(tg0, tname, scales, squash):
+        for tw in scales:
             sc = tw / float(tg0.shape[1])
-            t = cv2.resize(tg0, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+            t = cv2.resize(tg0, None, fx=sc * squash, fy=sc, interpolation=cv2.INTER_AREA)
             if t.shape[0] >= g.shape[0] or t.shape[1] >= g.shape[1]:
                 continue
             res = cv2.matchTemplate(g, t, cv2.TM_CCOEFF_NORMED)
@@ -1610,6 +1621,25 @@ def find_door_by_tpl(min_score=0.55, near=520):
                              'cy': (y + t.shape[0] // 2) * 2,
                              'w': t.shape[1] * 2,
                              'src': tname})
+
+    tg_list = []
+    for tname in DOOR_TEMPLATES:
+        tpl0 = cv2.imread(os.path.join(TPL_DIR, tname))
+        if tpl0 is None:
+            continue
+        tg_list.append((cv2.cvtColor(tpl0, cv2.COLOR_BGR2GRAY), tname))
+
+    # ---- 一级：原始模板（快） ----
+    for tg, tname in tg_list:
+        _scan(tg, tname, (90, 130, 175, 230, 300, 380), 1.0)
+    best1 = max([h['score'] for h in hits], default=0.0)
+
+    # ---- 二级：只有没达标才补姿态变体（慢，但只在必要时） ----
+    if best1 < min_score:
+        for tg, tname in tg_list:
+            for sq in (0.93, 0.85):
+                _scan(tg, tname, (130, 230), sq)
+
     if not hits:
         return None
     hits = [h for h in hits if h['score'] >= min_score]
@@ -1631,7 +1661,6 @@ def find_door_by_tpl(min_score=0.55, near=520):
     _TPL_LAST['cx'] = best['cx']
     best['h'] = int(best['w'] * 1.4)
     return best
-
 
 
 def find_door_pink(min_area_small=220):
@@ -1735,11 +1764,11 @@ def pick_door(min_score=0.60, tol_near=420):
         if _d is not None:
             return _d
 
-    _pk = find_door_pink()
-    if _pk is not None:
-        _d = _accept(_pk)
-        if _d is not None:
-            return _d
+    # ★★ 2026-11-09 定案：**不再用颜色判据找门**。
+    #   财富区的品红广告牌/海报与门颜色几乎一致（都品红+黄框），
+    #   实测每次都把广告牌当门（偏+1760 宽320 之类），追过去全是建筑 ✗
+    #   三次成功过门（财富/铸造/财富）全部是**模板命中**（0.65~0.82），
+    #   所以这里只信模板 + YOLO；模板没命中 ⇒ 门不在视野里，交给全景/VLM。
 
     _yd = yolo_pick(CATE_DOOR, min_conf=0.35)
     if _yd is not None:
@@ -2101,7 +2130,7 @@ def approach_door(max_seconds=60, center_tol=120):
         # ★★ 2026-11-09：**对正取 3 次中位数**（抑制跳变）+ **按门宽自适应步长**。
         #   实测：门很近时(宽560) door 偏仍在 +682/+1648/-160 之间跳，
         #   而 ±250 鼠标 ≈ ±260px 转向太粗 ⇒ 越对越偏、最后判"丢失目标" ✗
-        _ds = [x for x in (pick_door(min_score=0.50) for _ in range(3)) if x is not None]
+        _ds = [x for x in (pick_door(min_score=0.50) for _ in range(2)) if x is not None]
         d = None
         if _ds:
             _ds.sort(key=lambda z: z['cx'])
@@ -2270,6 +2299,62 @@ def vlm_door_eyes(d=None, pad=0.25):
     except Exception as e:
         log('      · VLM 判门状态失败（不影响主流程）: %s' % e)
         return None
+
+
+def walk_deadreckon_to_door(off, width, max_seconds=25):
+    """**航位推算走向门**（作者 2026-11-09 的教训总结）：
+
+        模板对角度敏感：正对 0.82，侧一点就掉到 0.55 以下 ⇒
+        **一边走一边重检测会立刻丢失目标**（实测每次都这样）。
+        正确做法：命中那一刻记住方向 → 转过去 → **盲走** → 每隔 0.8 秒按 F（OCR 校验）。
+
+    `off` = 命中时的像素偏移（+右 -左），`width` = 门宽（估计距离）。
+    """
+    # ★★ 2026-11-09：**先侧移绕开出生点前的栏杆**，再转向+直走。
+    #   实测"对准了却走不过去"就是被栏杆挡住。
+    import random as _r
+    _sd = _r.choice(('a', 'd'))
+    log('      · 先侧移 %s 1.8 秒绕开栏杆/装置' % _sd.upper())
+    pyautogui.keyDown(_sd)
+    time.sleep(1.8)
+    pyautogui.keyUp(_sd)
+    time.sleep(0.3)
+    # ① 按实测增益转向（Δoffset ≈ -1.2 × Δmouse，符号取反）
+    mx = int(max(-700, min(700, off / 1.2)))
+    if mx:
+        log('      · 航位推算：转 %+d（目标偏%+d）' % (mx, off))
+        _send_input_move(mx, 0)
+        time.sleep(0.45)
+    # ② 估计距离：门宽 320 约 8 米；按比例估步行时间
+    walk_sec = max(1.2, min(4.5, 320.0 / max(80, width) * 1.4))
+    log('      · 盲走 %.1f 秒（门宽 %d ⇒ 估计距离）' % (walk_sec, width))
+    t0 = time.time()
+    _seg = 0
+    while time.time() - t0 < max_seconds:
+        _seg += 1
+        # 每 2 段侧移一次，绕开栏杆/装置
+        if _seg % 2 == 0:
+            _sd = 'a' if (_seg // 2) % 2 == 1 else 'd'
+            log('      · 航位推算第%d段：侧移 %s 绕障' % (_seg, _sd.upper()))
+            pyautogui.keyDown(_sd)
+            time.sleep(0.5)
+            pyautogui.keyUp(_sd)
+            time.sleep(0.2)
+        pyautogui.keyDown('w')
+        time.sleep(walk_sec if _seg == 1 else 0.9)
+        pyautogui.keyUp('w')
+        time.sleep(0.25)
+        if on_station_picker() or area_passed():
+            log('      · ★ 已出现选站点卡')
+            return True
+        press_f_checked()
+        if on_station_picker() or area_passed():
+            log('      · ★ 按 F 后出现选站点卡')
+            return True
+        if is_event_ui():
+            do_event_dialog()
+            return True
+    return on_station_picker() or area_passed()
 
 
 def walk_into_door(d, max_seconds=40):
@@ -3059,9 +3144,13 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
                     return True
                 log('      · 提示「%s」交互后未出站点卡，继续常规流程' % _w)
             elif hit['kind'] == 'door':
-                # ★★ 预算给足：对正本身就要 20~30 秒（每步 3 次检测），
-                #   原 walk_seconds//2=30 秒会被对正吃光，导致"只走 1 段就放弃" ✗
-                if approach_door(max_seconds=max(90, walk_seconds * 2)):
+                # ★★ 2026-11-09：首扫命中门时**先用航位推算直走**（模板对角度敏感，
+                #   边转边重检测必丢；命中那一刻的方向最可信）。
+                _hd = hit['data']
+                if walk_deadreckon_to_door(_hd['cx'] - 1920, _hd['w']):
+                    return True
+                # 航位推算没成 → 再退回逐步对正（补足距离/角度偏差）
+                if approach_door(max_seconds=max(240, walk_seconds * 4)):
                     return True
                 # ★ 作者要求：首扫看到门但对不上/进不去 ⇒ **本轮到此为止**，
                 #   不要接着覆盖推进（点地面乱走最浪费时间）
