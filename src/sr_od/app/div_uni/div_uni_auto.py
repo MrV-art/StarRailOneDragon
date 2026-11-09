@@ -2371,6 +2371,14 @@ def in_div_uni_area(items=None):
         items2 = items
         full_txt = '|'.join(_texts(items))
     hud = ''.join(t.strip() for t, s, _, _ in items2 if s >= 0.4)
+    # ★★ 2026-11-09 实测修正：**菜单/结算页也会让旧判据返回 True**。
+    #   现象：停在「模式选择 / 周期演算详情」页时 in_div_uni_area()=True
+    #   → auto_entry 认为"已经在局内"→ 跳过进场 → 脚本对着菜单找门、左转右转 ✗
+    #   判据：整屏出现菜单特征词、且**没有**「位面-」HUD ⇒ 一定不在区域里。
+    _MENU_MARKS = ('模式选择', '开始游戏', '分析报告', '已过期', '本期剩余时间',
+                   '积分奖励', '规则说明', '拟合等级', '乐园漫记', '查看详情', '结束并结算')
+    if any(k in full_txt for k in _MENU_MARKS) and '位面-' not in full_txt             and '位面' not in hud:
+        return False
     if _re.search(r'\d+\s*/\s*\d+', hud):
         return True
     for k in AREA_KINDS:
@@ -2383,84 +2391,115 @@ def in_div_uni_area(items=None):
     return False
 
 
-def enter_divergent(h):
-    """从大世界进入差分宇宙·周期演算（走「指南」二级菜单，全程 OCR 找文字）。
+def enter_divergent(h=None):
+    """进入差分宇宙·周期演算并开始/继续一局（**状态机 + OCR，不写死坐标**）。
 
-    实测路径（2026-11-07/08 手工核对过三次）：
-        ESC(手机菜单) → 指南 → 差分宇宙 → 前往参与 → 开始游戏 → 周期演算 → 继续进度/启动
+    ★ 2026-11-09 全流程实测（作者要求"让脚本来操作"），确认的路径：
+        大世界 →（站在差分宇宙终端旁）按 **F** → 大厅（开始游戏）
+        → 模式选择（周期演算）→ 详情页
+        → 若「已过期」：结束并结算 → 确认 → 分析报告 → 返回主界面 → 再走一遍
+        → 继续进度 / 开始挑战 → 选面具 → 进入 (1/13) 区域
 
-    ⚠️ 历史坑：第一版是「按 F 打开入口面板」✗ —— 那只在角色**站在差分宇宙终端旁边**时成立；
-       在收容舱段/开拓之尾号按 F 只会触发环境交互，然后自然找不到「开始游戏」→ 整局判失败。
-    ⚠️ 不写死任何坐标：一律用 OCR 找文字再点（本机 200% 缩放下写死坐标必踩坑）。
+    ★ 三个必须处理的弹窗（都是实测撞到的）：
+        ① 「当前存档非本周演算进度…确定继续进度吗？」→ 点 **取消**（放弃过期存档）
+        ② 「…确定结算奖励并重置进度吗？」→ 点 **确认**
+        ③ 「分析报告」→ 点 **返回主界面**
     """
-    log('  ① 进入差分宇宙（指南 → 差分宇宙 → 前往参与 → 开始游戏 → 周期演算）')
-    if not ensure_foreground(h):
+    if h is None:
+        h = find_game()
+    if not h or not ensure_foreground(h):
         log('      ✗ 抢不到前台')
         return False
-
-    # 已经在副本里（区域画面 / 选站点卡）就不用进场
     if on_station_picker() or in_div_uni_area():
         log('      · 已经在副本里，跳过进场')
         return True
 
-    # ---- 0. 先清掉可能挡路的弹窗/公告（点空白 + ESC 一次） ----
-    if not is_world() and not ocr_find('指南', tries=1, interval=0.4):
-        log('      · 当前不在大世界，先点空白/ESC 收拾一下')
-        click_phys(*P['dialog_next'], settle=0.6)
-        press('esc', 1.5)
-
-    # ---- 1. 打开「指南」 ----
-    ok = click_text('指南', tries=6, interval=1.5)
-    if not ok:
-        log('      · 没找到「指南」→ 按 ESC 打开手机菜单再试')
-        press('esc', 2.2)
-        ok = click_text('指南', tries=6, interval=1.5)
-    if not ok:
-        # 兜底：ESC 后直接点指南图标（实测位置，仅在文字识别彻底失败时用）
-        log('      · 兜底：按实测位置点指南图标')
-        click_phys(*P['menu_guide'], settle=1.2)
-        time.sleep(1.5)
-    time.sleep(2.0)
-
-    # ---- 2. 指南里找「差分宇宙」 ----
-    # 实测（sr_enter_new2.png）：差分宇宙不在默认的「生存索引」页，而在顶部那排**图标页签**
-    # 第 3 个（带红点）下面 —— 图标没有文字，OCR 抓不到 ⇒ 只能用一次兜底坐标 P['tab_planet']。
-    if not click_text('差分宇宙', tries=4, interval=1.2):
-        log('      · 先点顶部「星球」图标页签（图标无文字，用兜底坐标）')
-        click_phys(*P['tab_planet'], settle=1.5)
-        time.sleep(2.5)
-        if not click_text('差分宇宙', tries=6, interval=1.5):
-            log('      ✗ 指南里找不到「差分宇宙」')
+    def click_txt(name, tries=2, wait=1.3):
+        p = ocr_find(name, tries=tries, interval=0.9)
+        if not p:
             return False
-    time.sleep(3.0)
+        log('        · 点「%s」@ (%d,%d)' % (name, p[0], p[1]))
+        click_phys(p[0], p[1], settle=wait)
+        time.sleep(0.9)
+        return True
 
-    # ---- 3. 前往参与 ----
-    if not click_text('前往参与', tries=6, interval=1.5):
-        log('      · 没有「前往参与」（可能已直达入口页）')
-    time.sleep(6.0)
+    f_tried = 0
+    for step in range(50):
+        time.sleep(1.0)
+        if on_station_picker() or in_div_uni_area():
+            log('      ✓ 已进入差分宇宙（area=%s）' % (area_kind() or '?'))
+            return True
+        img = screenshot()
+        items = ocr_items(img)
+        joined = '|'.join(t.strip() for t, s, _, _ in items if s >= 0.6)
 
-    # ---- 4. 开始游戏 ----
-    if not click_text('开始游戏', tries=8, interval=1.5):
-        log('      ✗ 没找到「开始游戏」')
-        return False
-    time.sleep(6.0)
+        # ---------- 弹窗（优先级最高） ----------
+        if '非本周演算进度' in joined:
+            log('      · 存档非本周进度 → 取消（放弃过期存档）')
+            click_txt('取消') or click_txt('确认')
+            continue
+        if '确定结算奖励并重置' in joined:
+            log('      · 结算确认 → 确认')
+            click_txt('确认') or click_txt('确定')
+            continue
+        if '分析报告' in joined:
+            click_txt('返回主界面') or click_txt('返回')
+            continue
+        if '点击空白处关闭' in joined:
+            click_phys(*P['dialog_next'], settle=0.8)
+            continue
+        if '选择一张面具' in joined or '选择面具' in joined:
+            log('      · 选面具')
+            pick_first_card()
+            continue
 
-    # ---- 5. 周期演算 ----
-    if not click_text('周期演算', tries=8, interval=1.5):
-        log('      ✗ 没找到「周期演算」（可能界面上叫别的名字）')
-        return False
-    time.sleep(4.0)
+        # ---------- 大厅 / 模式选择 / 详情页 ----------
+        if '模式选择' in joined:
+            click_txt('周期演算')
+            continue
+        if '开始游戏' in joined:
+            click_txt('开始游戏')
+            continue
+        if '已过期' in joined and '结束并结算' in joined:
+            log('      · 存档已过期 → 结束并结算（重置后开新局）')
+            click_txt('结束并结算')
+            continue
+        if '继续进度' in joined:
+            click_txt('继续进度')
+            continue
+        if '开始挑战' in joined or '开始演算' in joined:
+            click_txt('开始挑战') or click_txt('开始演算')
+            continue
+        # ★ 2026-11-09 取证：**详情页的进入按钮叫「启动「差分宇宙」」**（底部右侧），
+        #   而「周期演算：喜剧秀场」只是标题标签 —— 点它只会在"模式选择↔详情页"之间
+        #   来回跳（实测无限 ping-pong）✗
+        if '启动' in joined:
+            click_txt('启动')
+            continue
+        if '周期演算' in joined and '小时' in joined:
+            # 详情页但没看到「启动」→ 先回上一层（模式选择）
+            log('      · 详情页没看到「启动」→ ESC 回上一级')
+            press('esc', 1.2)
+            continue
 
-    # ---- 6. 继续进度（有存档）/ 启动（新一局） ----
-    if click_text('继续进度', tries=4, interval=1.2):
-        log('      · 已选「继续进度」')
-    elif click_text('启动', tries=8, interval=1.5):
-        log('      · 已选「启动」')
-    else:
-        log('      ✗ 既没有「继续进度」也没有「启动」')
-        return False
-    time.sleep(16.0)
-    return True
+        # ---------- 大世界：终端按 F（最多 3 次），再走指南兜底 ----------
+        if is_world():
+            if f_tried < 3:
+                f_tried += 1
+                log('      · 大世界：按 F 试开差分宇宙终端（第%d次）' % f_tried)
+                press('f', 1.6)
+                time.sleep(1.2)
+                continue
+            if click_txt('指南', tries=2):
+                continue
+            press('esc', 1.2)
+            continue
+
+        # 其它未知界面：ESC 收拾一下
+        press('esc', 1.0)
+
+    log('      ✗ 进场超时（50 步）')
+    return False
 
 
 def do_area_action(kind_hint=''):
@@ -2569,6 +2608,18 @@ def is_in_run(verbose=True):
       ② 当前界面属于局内状态（面具/奇迹/站点卡/暂停面板/事件/战斗）。
     """
     st = detect_state(verbose=False)[0]
+    # ★★ 2026-11-09 实测修正：**大厅/详情页必须否决**。
+    #   现象：周期演算详情页有「通关可获得积分」→ 命中 event_dialog 的 '获得'
+    #   → is_in_run 返回 True → auto_entry 跳过进场 → 脚本对着菜单找门 ✗
+    #   代码里原本就有 LOBBY_HINTS 却没被用上，这里补上。
+    try:
+        joined = '|'.join(_texts(ocr_items()))
+    except Exception:
+        joined = ''
+    if any(k in joined for k in LOBBY_HINTS) and '位面-' not in joined:
+        if verbose:
+            log('      · 大厅/详情页特征命中 → 不在局内')
+        return False, st
     if st in IN_RUN_STATES and st != 'in_area':
         return True, st
     if in_div_uni_area():
@@ -2717,13 +2768,26 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
             #   血泪：① 模板匹配 score=1.000 命中后点 (300,1600) **选不中** ✗
             #        ② 我从截图目测估的卡面位置差了 1000+ 像素 ✗（真卡面在画面最下面）
             #   所以这一屏就固定用上面这组 ✓
-            click_phys(628, 1828, settle=1.5)
-            time.sleep(1.6)
-            if not click_text('确定', tries=3, interval=1.0) and \
-                    not click_text('确认', tries=2, interval=1.0):
-                log('      · 没有确定按钮 → 点右下角确认位 (3152,1964)')
-                click_phys(3152, 1964, settle=1.2)
-            time.sleep(8.0)
+            # ★★ 2026-11-09 实测（喜剧秀场这一版）：面具是**竖向列表**
+            #   「镜头面具(966,825) / 斗士面具(966,1199) / 财猫面具(966,1570)」，
+            #   **屏幕上根本没有「确定」按钮** —— 点卡片本身就算选中。
+            #   旧代码死点 (628,1828) 会落空，然后等 8 秒、无限循环 ✗
+            _clicked = False
+            for _name in ('镜头面具', '斗士面具', '财猫面具', '欢愉假面', '面具'):
+                _p = ocr_find(_name, tries=1, interval=0.4)
+                if _p:
+                    log('      · 点面具「%s」@ (%d,%d)' % (_name, _p[0], _p[1]))
+                    click_phys(_p[0], _p[1], settle=1.5)
+                    _clicked = True
+                    break
+            if not _clicked:
+                log('      · 没认出面具名 → 兜底点左下卡面 (628,1828)')
+                click_phys(628, 1828, settle=1.5)
+            time.sleep(1.8)
+            if not click_text('确定', tries=2, interval=0.8) and \
+                    not click_text('确认', tries=2, interval=0.8):
+                log('      · 无确定按钮（这一版就是点卡即选）→ 继续等进区域')
+            time.sleep(6.0)
             continue
         if state == 'pick_miracle':
             log('      · 这是「选择惊世奇迹」界面')
