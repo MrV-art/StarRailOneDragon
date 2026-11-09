@@ -841,8 +841,38 @@ def is_world(items=None):
     return ('位面' in txt) or ('状态效果' in txt)
 
 
+def event_ui_topleft():
+    """**OCR 左上角**判断是否在事件界面（作者 2026-11-09 建议）。
+
+    依据画面布局：
+      * 事件界面：左上角显示「差分宇宙 / 事件」（小图标 + 两行字）
+      * 区域里  ：左上角显示「（n/13）第一位面-铸造」
+
+    只裁左上 900x280 再放大 2 倍做 OCR —— 比整屏 OCR 快一个数量级（~50ms vs 1~2s），
+    而且不会因为对话框正文里出现"事件"二字而误判 ✓
+    """
+    try:
+        import cv2
+        img = screenshot()
+        crop = img[0:300, 0:950]
+        crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        txt = ''.join(t.strip() for t, s, _, _ in ocr_items(crop) if s >= 0.35)
+        return '事件' in txt
+    except Exception:
+        return False
+
+
 def is_event_ui(items=None):
-    """事件全屏界面：左上「差分宇宙 / 事件」，且不是区域。"""
+    """事件全屏界面。
+
+    ★ 2026-11-09 作者建议：**先 OCR 左上角**（那里直接写「差分宇宙 / 事件」），
+      比整屏匹配又快又准；整屏匹配保留作兜底。
+    """
+    try:
+        if items is None and event_ui_topleft():
+            return True
+    except Exception:
+        pass
     items = items if items is not None else ocr_items()
     txt = '|'.join(_texts(items))
     return ('差分宇宙' in txt) and ('事件' in txt) and not is_world(items)
@@ -3019,8 +3049,12 @@ def enter_divergent(h=None):
     if not h or not ensure_foreground(h):
         log('      ✗ 抢不到前台')
         return False
-    if on_station_picker() or in_div_uni_area():
-        log('      · 已经在副本里，跳过进场')
+    if on_station_picker() or in_div_uni_area() or is_event_ui():
+        if is_event_ui():
+            log('      · 当前在事件全屏界面 → 先把剧情走完（不要按 ESC）')
+            do_event_dialog()
+        else:
+            log('      · 已经在副本里，跳过进场')
         return True
 
     def click_txt(name, tries=2, wait=1.3):
@@ -3218,6 +3252,11 @@ def is_in_run(verbose=True):
       ② 当前界面属于局内状态（面具/奇迹/站点卡/暂停面板/事件/战斗）。
     """
     st = detect_state(verbose=False)[0]
+    # ★★ 2026-11-09：**事件全屏界面也算"在局内"**。
+    #   实测：事件页的 detect_state 是 in_area、in_div_uni_area=False
+    #   ⇒ auto_entry 判成"不在局内"→ enter_divergent 在事件页上一直按 ESC ✗
+    if is_event_ui():
+        return True, 'event_dialog'
     # ★★ 2026-11-09 实测修正：**大厅/详情页必须否决**。
     #   现象：周期演算详情页有「通关可获得积分」→ 命中 event_dialog 的 '获得'
     #   → is_in_run 返回 True → auto_entry 跳过进场 → 脚本对着菜单找门 ✗
