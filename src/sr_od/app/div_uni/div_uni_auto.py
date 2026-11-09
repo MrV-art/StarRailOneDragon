@@ -1977,6 +1977,7 @@ def approach_door(max_seconds=60, center_tol=120):
         return coverage_clear(max_seconds=min(70.0, max_seconds))
 
     for seg in range(12):
+        check_pause('过门')
         if time.time() - t0 > max_seconds:
             break
         if on_station_picker() or area_passed():
@@ -2211,6 +2212,7 @@ def hunt_enemies(max_seconds=100):
     log('      · 战斗区：**放一次秘技(E)** → 往前走覆盖敌人')
     use_technique()
     while time.time() - t0 < max_seconds:
+        check_pause('战斗区')
         if on_station_picker() or area_passed():
             return True
         if in_battle():
@@ -2675,6 +2677,35 @@ def use_technique():
     return True
 
 
+PAUSE_FILE = r"D:\_TOOL_DSH\workbench\div_uni.pause"
+
+
+def check_pause(tag=''):
+    """**可暂停**（作者 2026-11-09 要求）：插队插件写 PAUSE_FILE ⇒ 脚本原地挂起。
+
+    设计要点：
+      * **不杀进程、不丢进度** —— 只是松开所有按键、原地等；
+      * 文件被删掉后自动继续；
+      * 在每一步/每个循环里调用（开销极小：一次 os.path.exists）。
+    """
+    if not os.path.exists(PAUSE_FILE):
+        return False
+    log('      ⏸ 检测到暂停文件 → 松开按键，原地挂起%s' % (('（' + tag + '）') if tag else ''))
+    try:
+        for k in ('w', 'a', 's', 'd'):
+            pyautogui.keyUp(k)
+    except Exception:
+        pass
+    _waited = 0
+    while os.path.exists(PAUSE_FILE):
+        time.sleep(1.0)
+        _waited += 1
+        if _waited % 30 == 0:
+            log('      ⏸ 仍在暂停中（已等 %d 秒）…' % _waited)
+    log('      ▶ 暂停文件已移除 → 继续')
+    return True
+
+
 def in_div_uni_area(items=None):
     """是否真的在差分宇宙的区域里。
 
@@ -3026,6 +3057,7 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
     _same = 0
 
     for i in range(1, max_areas + 1):
+        check_pause('主循环')
         log('')
         log('  === 第 %d 轮 ===' % i)
 
