@@ -1583,11 +1583,23 @@ def goto_by_panorama(n=40, step=500, max_iter=12):
 # 2026-11-08 实测：door9（财富区裁的）在铸造区只有 0.32 不达标；
 # 而 door_casting（铸造区四方向图里裁的，190×268）自匹配 1.000 ✓。
 DOOR_TEMPLATES = ('door9.png', 'door_casting.png', 'door_wealth.png')
+
+# ★★★ 2026-11-09 作者点出的瓶颈：**门一转过去模板就丢**（正对 0.82、偏 30° 掉到 0.5 以下），
+#   而闭环恰恰要求"转的过程中还能看见门"。
+#   对策：用 cv2 透视变换把正对模板生成 **±15°/±30° 变体**（远边变窄变矮，就是侧看的样子）。
+#   ⚠ 这些**只在二级匹配**里用（一级没命中才补），否则 7 个模板 × 6 尺度太慢（1.9 秒/次）✗
+DOOR_TEMPLATES_ANGLED = (
+    'door_wealth_m15r.png', 'door_wealth_m15l.png',
+    'door_wealth_m30r.png', 'door_wealth_m30l.png',
+)
 # 2026-11-09 新增 door_wealth.png：从「财富」区实拍裁的（粉门+两只白眼+黄框窗），自匹配 1.000。
 # 这区的品红广告牌/海报和门颜色几乎一样，**只能靠模板区分** ✓
 
 
-def find_door_by_tpl(min_score=0.55, near=520):
+def find_door_by_tpl(min_score=0.55, near=520, fast=False):
+    # ★ 2026-11-09：闭环伺服每步都要检测一次，而"一级+角度二级"实测 2110ms 太慢。
+    #   fast=True 时**只扫上次门宽附近的 3 个尺度**（约 300ms），供伺服循环使用；
+    #   整帧精确搜索仍用 fast=False。
     """用**门模板组**多尺度匹配找门，带时间一致性。
 
     ★ 2026-11-09 两处关键设计：
@@ -1629,16 +1641,28 @@ def find_door_by_tpl(min_score=0.55, near=520):
             continue
         tg_list.append((cv2.cvtColor(tpl0, cv2.COLOR_BGR2GRAY), tname))
 
-    # ---- 一级：原始模板（快） ----
+    # ---- 一级：原始模板 ----
+    _lw = _TPL_LAST.get('w') or 0
+    if fast and _lw >= 60:
+        _scales = tuple(int(max(60, min(420, _lw * f))) for f in (0.85, 1.0, 1.2))
+    else:
+        _scales = (90, 130, 175, 230, 300, 380)
     for tg, tname in tg_list:
-        _scan(tg, tname, (90, 130, 175, 230, 300, 380), 1.0)
+        _scan(tg, tname, _scales, 1.0)
     best1 = max([h['score'] for h in hits], default=0.0)
 
     # ---- 二级：只有没达标才补姿态变体（慢，但只在必要时） ----
-    if best1 < min_score:
+    if best1 < min_score and not fast:
         for tg, tname in tg_list:
             for sq in (0.93, 0.85):
                 _scan(tg, tname, (130, 230), sq)
+        # ★ 再补"多角度模板"（±15°/±30° 透视变体）—— 解决"一转过去就丢门"
+        for aname in DOOR_TEMPLATES_ANGLED:
+            ta = cv2.imread(os.path.join(TPL_DIR, aname))
+            if ta is None:
+                continue
+            tag = cv2.cvtColor(ta, cv2.COLOR_BGR2GRAY)
+            _scan(tag, aname, (110, 150, 200, 260), 1.0)
 
     if not hits:
         return None
@@ -1659,6 +1683,7 @@ def find_door_by_tpl(min_score=0.55, near=520):
     else:
         best = max(hits, key=lambda h: h['score'])
     _TPL_LAST['cx'] = best['cx']
+    _TPL_LAST['w'] = best['w']      # ★ 记住门宽，供 fast 模式推尺度
     best['h'] = int(best['w'] * 1.4)
     return best
 
@@ -2055,10 +2080,16 @@ def approach_door(max_seconds=60, center_tol=120):
                 log('      · 看到门 → 走过去按 F（用结果判定，不猜状态）')
                 if walk_into_door(_d0, max_seconds=45):
                     return True
-            log('      · 战斗类区域(%s) → 用「对门+秘技+直走」打法' % _kind)
+            # ★★★ 2026-11-09 作者定案（首领房）：
+            #   「没识别到门，说明有首领挡着，**应该开秘技打它**」
+            #   ⇒ 战斗区优先走 hunt_enemies（它内部：先看门 → 看不到就找敌人撞）
+            log('      · 战斗类区域(%s) → 先看门，看不到就开秘技打挡路的敌人' % _kind)
+            if hunt_enemies(max_seconds=min(150.0, max(90.0, max_seconds))):
+                return True
+            log('      · 清怪路线没成 → 退回「对门+秘技+直走」')
             if walk_door_with_technique(max_seconds=min(120.0, max(70.0, max_seconds))):
                 return True
-            log('      · 该打法没成 → 退回漫游找怪')
+            log('      · 两种打法都没成 → 退回漫游')
     # ★ 作者要求：**丢了目标就用全景**；这里 sweep=0 关掉"小幅度扫描"（它救不回来）
     if not turn_to_center_of(lambda: pick_door(min_score=0.55), name='门',
                              tol=tol, max_iter=12, sweep=0):
@@ -2301,59 +2332,285 @@ def vlm_door_eyes(d=None, pad=0.25):
         return None
 
 
-def walk_deadreckon_to_door(off, width, max_seconds=25):
-    """**航位推算走向门**（作者 2026-11-09 的教训总结）：
+_TURN_GAIN = {'g': None}          # 实测的「屏幕像素 / 鼠标像素」转向增益
 
-        模板对角度敏感：正对 0.82，侧一点就掉到 0.55 以下 ⇒
-        **一边走一边重检测会立刻丢失目标**（实测每次都这样）。
-        正确做法：命中那一刻记住方向 → 转过去 → **盲走** → 每隔 0.8 秒按 F（OCR 校验）。
+
+def measure_turn_gain(force=False):
+    """**现场实测转向增益**：发一个已知鼠标位移，看目标在屏幕上移动了多少像素。
+
+    ★★ 2026-11-09 作者问：「既然识别到门，为什么还会从旁边插肩而过？」
+       根因之一：**转向增益写死且不一致**（有的地方 off/2.4、有的 off/1.2）。
+       增益差一倍 ⇒ 以为对准了其实偏着 ⇒ 直着走就从门边擦过去了 ✗
+       对策：**每次实测**，用 real_gain 换算鼠标位移，闭环迭代到偏差 <60px。
+    返回 gain（px/mouse ≈ 0.4~0.6 属正常）或 None。
+    """
+    if _TURN_GAIN['g'] is not None and not force:
+        return _TURN_GAIN['g']
+    d1 = None
+    try:
+        d1 = pick_door(min_score=0.55)
+    except Exception:
+        d1 = None
+    if d1 is None:
+        return None
+    off1 = d1['cx'] - 1920
+    probe = 500
+    _send_input_move(probe, 0)
+    time.sleep(0.32)
+    d2 = None
+    try:
+        d2 = pick_door(min_score=0.55)
+    except Exception:
+        d2 = None
+    if d2 is None:
+        # 测不到就退回已知经验值
+        _TURN_GAIN['g'] = 1.0 / TURN_K if 'TURN_K' in globals() else 0.42
+        return _TURN_GAIN['g']
+    off2 = d2['cx'] - 1920
+    g = (off2 - off1) / float(probe)
+    if g == 0 or abs(g) < 0.05:
+        g = 0.42
+    _TURN_GAIN['g'] = g
+    log('      · 转向增益实测: %.3f px/鼠标（发%+d → 偏%+d→%+d）'
+        % (g, probe, off1, off2))
+    return g
+
+
+def servo_center_door(tol=60, max_iter=10):
+    """把门**精确**转到屏幕中心（用实测增益 + 迭代收敛）。返回 (ok, 最后偏差)。"""
+    g = measure_turn_gain()
+    if g is None:
+        return False, None
+    off = None
+    for i in range(max_iter):
+        d = None
+        try:
+            d = pick_door(min_score=0.55)
+        except Exception:
+            d = None
+        if d is None:
+            return False, off
+        off = d['cx'] - 1920
+        if abs(off) <= tol:
+            log('      · 已居中（偏%+d，第%d次）' % (off, i + 1))
+            return True, off
+        mx = -off / g * 0.9            # ★ 用实测增益换算，别再写死
+        mx = int(max(-900, min(900, mx)))
+        if mx == 0:
+            mx = 1 if off < 0 else -1
+        log('      · 居中第%d次：偏%+d → 转%+d（增益%.2f）' % (i + 1, off, mx, g))
+        _send_input_move(mx, 0)
+        time.sleep(0.3)
+    return False, off
+
+
+def approach_door_servo(max_seconds=90, tol=40, step_sec=0.45, min_score=0.55):
+    # ★★ 2026-11-09 作者对「闭环」的确切定义（照此实现）：
+    #     「旋转视角后，**确认目标是否在正中心**，如果在就移动，如果不在就继续旋转。」
+    #   ⇒ tol 收紧到 **40px**（1920 半宽的 2%，约 1° 视场）；
+    #   ⇒ **只有真正居中才允许前进**，否则只转不走（以前偏 90px 也照样走 → 擦肩而过 ✗）。
+    """**闭环伺服走向门**（★ 作者 2026-11-09 的质问点出的要害）：
+
+        作者原话：「既然识别到了目标门，为什么还会走错路线呢，不能直直朝着门走过去呢？」
+
+        根因：之前是**开环**的 —— 「转一次 → 按住 W 走 1.5~N 秒 → 再检测」。
+        走的这段时间里**完全不看门**，转向增益一旦有偏差、或半路被东西挡一下，
+        就会偏出去，然后越走越远（擦肩而过）✗
+
+        现在改成**闭环**，每一小步都：看门 → 修朝向 → 走一小步，直到：
+          * 门宽足够大（很近了）⇒ 走近 + 按 F（OCR 校验）；
+          * 出现选站点卡 ⇒ 成功；
+          * 门连续几步看不见 ⇒ 小步原地转找回；
+          * **门宽连续几步不涨（被挡住）⇒ 侧移绕开**，这正是"绕过障碍物到目标"的能力。
+    """
+    import numpy as _np
+    t0 = time.time()
+    last_off = 0
+    lost = 0
+    last_w = 0
+    no_grow = 0
+    steps = 0
+
+    log('      · 闭环伺服走向门（先精确居中，再小步闭环前进）')
+    # ★ 先用实测增益把门精确转到屏幕中心（作者要的"转到中心再走"）
+    try:
+        _ok_center, _offc = servo_center_door(tol=50, max_iter=12)
+        if _ok_center:
+            log('      · 居中完成（偏%+d）→ 开始小步前进' % (_offc or 0))
+    except Exception as _e:
+        log('      · 居中过程出错: %s' % _e)
+    while time.time() - t0 < max_seconds:
+        check_pause('走向门')
+        steps += 1
+        if on_station_picker() or area_passed():
+            log('      · ★ 到站（第%d步）' % steps)
+            return True
+        if in_battle():
+            log('      · 半路遇怪 → 打它')
+            wait_battle(timeout=420)
+            continue
+        if is_event_ui():
+            log('      · 半路遇事件 → 交互')
+            do_event_dialog()
+            continue
+
+        d = None
+        try:
+            d = find_door_by_tpl(min_score=min_score, fast=True)
+        except Exception:
+            d = None
+
+        if d is None:
+            lost += 1
+            if lost <= 4:
+                # 只是这一帧没认到 ⇒ 朝最后已知方向再走一小步
+                log('      · 这一帧没看到门（第%d次）→ 朝最后方向走一小步' % lost)
+                pyautogui.keyDown('w')
+                time.sleep(step_sec)
+                pyautogui.keyUp('w')
+                time.sleep(0.12)
+            elif lost <= 14:
+                # 连续丢 ⇒ 原地小步转，把门找回来
+                log('      · 连续 %d 帧没门 → 原地小转找回' % lost)
+                _send_input_move(420 if (lost % 2) else -420, 0)
+                time.sleep(0.3)
+            else:
+                log('      · 门彻底丢了（%d 帧）→ 放弃伺服' % lost)
+                return False
+            continue
+
+        lost = 0
+        off = d['cx'] - 1920
+        w = d['w']
+        last_off = off
+
+        # ── 判断"被挡住"：已经对准了但门宽连续不涨 ──
+        if abs(off) <= tol:
+            if last_w and w <= last_w * 1.03:
+                no_grow += 1
+            else:
+                no_grow = 0
+            last_w = w
+            if no_grow >= 4:
+                side = 'a' if (no_grow // 4) % 2 == 1 else 'd'
+                log('      · 门宽连续 %d 步不涨（%d）⇒ 被挡住 → 侧移 %s 绕开'
+                    % (no_grow, w, side.upper()))
+                pyautogui.keyDown(side)
+                time.sleep(0.65)
+                pyautogui.keyUp(side)
+                time.sleep(0.12)
+                no_grow = 0
+                last_w = 0
+                continue
+        else:
+            no_grow = 0
+            last_w = 0
+
+        # ── 不在正中心 ⇒ **只转，不走**（作者要求）──
+        if abs(off) > tol:
+            _g = _TURN_GAIN['g'] or 0.42
+            mx = int(max(-300.0, min(300.0, -off / _g * 0.9)))
+            if mx == 0:
+                mx = 1 if off < 0 else -1
+            log('      · 第%d步 偏%+d（>±%d，不在正中心）→ 只转%+d' % (steps, off, tol, mx))
+            _send_input_move(mx, 0)
+            time.sleep(0.2)
+            continue
+        log('      · 第%d步 ✓ 已在正中心（偏%+d）→ 允许前进' % (steps, off))
+
+        # ── 已对准 → 走一小步。很近就直接按 F ──
+        if w >= 300:
+            log('      · 门很近（宽%d）→ 走一小步 + 按 F' % w)
+            pyautogui.keyDown('w')
+            time.sleep(0.45)
+            pyautogui.keyUp('w')
+            time.sleep(0.12)
+            if press_f_checked():
+                time.sleep(1.2)
+                if on_station_picker() or area_passed():
+                    log('      · ★ 按 F 进门')
+                    return True
+            continue
+
+        log('      · 第%d步 已对准（宽%d）→ 前进 %.2fs' % (steps, w, step_sec))
+        pyautogui.keyDown('w')
+        time.sleep(step_sec)
+        pyautogui.keyUp('w')
+        time.sleep(0.1)
+
+    log('      · 伺服超时（%.0f 秒）' % max_seconds)
+    return on_station_picker() or area_passed()
+
+
+def walk_deadreckon_to_door(off, width, max_seconds=25):
+    """**航位推算走向门**：转向 → **按住 W 连续走** → 用一次 D 绕开障碍 → 按 F。
+
+    ★★★ 2026-11-09 作者亲自纠正（录像 + 口头），这里记录三条**事实**：
+      1. **一次键要长按**：按住 W 连续走比"0.8 秒一顿"快得多；此前 0.8s+停 0.25s
+         的碎步走法既慢又容易走偏 ✗
+      2. **距离并不远**：出生点→门正常走法 **不到 5 秒**；
+         录像里走了 90 秒是因为作者**故意慢慢演示** ⇒ 不要按 90 秒设计。
+      3. **绕障只需一次 D**：直线上挡着装置/栏杆，往 D 侧打一下（约 0.5 秒）再继续 W 就过了。
 
     `off` = 命中时的像素偏移（+右 -左），`width` = 门宽（估计距离）。
     """
-    # ★★ 2026-11-09：**先侧移绕开出生点前的栏杆**，再转向+直走。
-    #   实测"对准了却走不过去"就是被栏杆挡住。
-    import random as _r
-    _sd = _r.choice(('a', 'd'))
-    log('      · 先侧移 %s 1.8 秒绕开栏杆/装置' % _sd.upper())
-    pyautogui.keyDown(_sd)
-    time.sleep(1.8)
-    pyautogui.keyUp(_sd)
-    time.sleep(0.3)
     # ① 按实测增益转向（Δoffset ≈ -1.2 × Δmouse，符号取反）
     mx = int(max(-700, min(700, off / 1.2)))
     if mx:
         log('      · 航位推算：转 %+d（目标偏%+d）' % (mx, off))
         _send_input_move(mx, 0)
-        time.sleep(0.45)
-    # ② 估计距离：门宽 320 约 8 米；按比例估步行时间
-    walk_sec = max(1.2, min(4.5, 320.0 / max(80, width) * 1.4))
-    log('      · 盲走 %.1f 秒（门宽 %d ⇒ 估计距离）' % (walk_sec, width))
+        time.sleep(0.35)
+
+    # ② 先按住 W 走 1.2 秒
+    log('      · 按住 W 直走 1.2 秒')
+    pyautogui.keyDown('w')
+    time.sleep(1.2)
+    pyautogui.keyUp('w')
+    time.sleep(0.15)
+    if on_station_picker() or area_passed():
+        log('      · ★ 直接就到了')
+        return True
+    if press_f_checked():
+        if on_station_picker() or area_passed():
+            log('      · ★ 按 F 后进门')
+            return True
+
+    # ③ 侧打一下 D（绕开中间挡着的装置/栏杆，约 0.5 秒）
+    log('      · 侧打 D 0.5 秒绕开中间障碍')
+    pyautogui.keyDown('d')
+    time.sleep(0.5)
+    pyautogui.keyUp('d')
+    time.sleep(0.1)
+
+    # ④ 再按住 W 连续走（每次 1.5 秒，基本不停）
     t0 = time.time()
-    _seg = 0
+    seg = 0
     while time.time() - t0 < max_seconds:
-        _seg += 1
-        # 每 2 段侧移一次，绕开栏杆/装置
-        if _seg % 2 == 0:
-            _sd = 'a' if (_seg // 2) % 2 == 1 else 'd'
-            log('      · 航位推算第%d段：侧移 %s 绕障' % (_seg, _sd.upper()))
-            pyautogui.keyDown(_sd)
-            time.sleep(0.5)
-            pyautogui.keyUp(_sd)
-            time.sleep(0.2)
+        seg += 1
+        log('      · 第%d段：按住 W 直走 1.5 秒' % seg)
         pyautogui.keyDown('w')
-        time.sleep(walk_sec if _seg == 1 else 0.9)
+        time.sleep(1.5)
         pyautogui.keyUp('w')
-        time.sleep(0.25)
+        time.sleep(0.12)
         if on_station_picker() or area_passed():
-            log('      · ★ 已出现选站点卡')
+            log('      · ★ 到位（出现选站点卡/过关）')
             return True
-        press_f_checked()
-        if on_station_picker() or area_passed():
-            log('      · ★ 按 F 后出现选站点卡')
-            return True
+        if press_f_checked():
+            if on_station_picker() or area_passed():
+                log('      · ★ 按 F 后进门')
+                return True
         if is_event_ui():
+            log('      · 遇到事件界面 → 交给事件处理')
             do_event_dialog()
             return True
+        # 走了 3 段还没到 ⇒ 再侧打一次（左右交替）
+        if seg in (3, 6):
+            _sd = 'd' if seg == 3 else 'a'
+            log('      · 第%d段后仍没到 → 侧打 %s 0.45 秒' % (seg, _sd.upper()))
+            pyautogui.keyDown(_sd)
+            time.sleep(0.45)
+            pyautogui.keyUp(_sd)
+            time.sleep(0.1)
     return on_station_picker() or area_passed()
 
 
@@ -2473,49 +2730,112 @@ def walk_door_with_technique(max_seconds=110):
 
 
 def hunt_enemies(max_seconds=100):
-    """战斗/精英/首领区：**直接开秘技(E) + 往前走**，直到圈罩住敌人进战斗。
+    """战斗/精英/首领区：**先看门，看不到门 ⇒ 首领挡着 ⇒ 开秘技打它**。
 
-    ★ 2026-11-09 作者原话（这才是正确做法，之前把它想复杂了）：
-        「战斗的房间直接开秘技，然后往前走，直到覆盖到敌人就行啦」
-        「左上角不是写着第一位面-战斗嘛，那脚本应该知道要先找敌人啊」
+    ★★★ 2026-11-09 作者原话（这就是本题的正解）：
+        「这个是首领房间，你如果**没识别到门，说明有首领挡着，应该开秘技打它**。」
 
-    ⇒ 不需要等顶部敌人标识、不需要先找门：
-      1. 先按 E 开秘技（秘技圈跟着角色走）；
-      2. 一直往前走（+小幅转向，扫得更宽）；
-      3. 隔几步再按一次 E（秘技可能有多段/冷却）；
-      4. 进战斗就交给 wait_battle。
+    正确顺序：
+      1. 先找门（模板/颜色）—— 能看到门就直接走过去；
+      2. **看不到门 ⇒ 一定有敌人挡在中间**：
+         a. 用 YOLO 找敌人（CATE_ENEMY）；找到就**对准 + 撞上去**（charge_enemy）；
+         b. 没找到 ⇒ **原地小步转**（约 10°/次）扫一圈找敌人，
+            ⚠ 绝不能像以前那样随机 ±900 大转 —— 那会越走越偏（实测走 120 秒都没碰到怪 ✗）
+      3. 进战斗就交给 wait_battle（自动战斗 + 选祝福）；
+      4. 打完再看门 → 出现选站点卡就返回 True。
     """
-    import random
     t0 = time.time()
-    step = 0
-    # ★★ 2026-11-09 作者硬规则：**只放一次秘技**。
-    #   没打到怪 ⇒ 说明没覆盖到怪 ⇒ 停下来找作者（不再补按、不再乱走）。
-    log('      · 战斗区：**放一次秘技(E)** → 往前走覆盖敌人')
-    use_technique()
+    log('      · 战斗区：先找门；找不到门 ⇒ 开秘技打挡路的敌人')
+
+    # ---- ① 先看门 ----
+    d = None
+    try:
+        d = find_door_by_tpl(min_score=0.55)
+    except Exception:
+        d = None
+    if d is None:
+        d = find_door_pink()
+    if d is not None:
+        off = d['cx'] - 1920
+        if abs(off) > 140:
+            mx = int(max(-300.0, min(300.0, off / TURN_K * TURN_DAMP)))
+            if mx:
+                log('      · 看到门：偏%+d → 先转%+d' % (off, mx))
+                _send_input_move(mx, 0)
+                time.sleep(0.35)
+        log('      · 门可见 → 放秘技后朝门直走')
+        use_technique()
+        pyautogui.keyDown('w')
+        time.sleep(1.6)
+        pyautogui.keyUp('w')
+        time.sleep(0.15)
+        if on_station_picker() or area_passed():
+            return True
+
+    # ---- ② 看不到门 ⇒ 打挡路的敌人 ----
+    if d is None:
+        log('      · 没看到门 ⇒ 首领挡着 ⇒ **放秘技(E) + 找它打**')
+        use_technique()
+
+    scan = 0
     while time.time() - t0 < max_seconds:
         check_pause('战斗区')
         if on_station_picker() or area_passed():
             return True
         if in_battle():
-            log('      · ★ 秘技命中 → 进战斗')
+            log('      · ★ 进战斗')
             wait_battle(timeout=420)
-            return True
-        step += 1
-        pyautogui.keyDown('w')
-        time.sleep(random.uniform(0.9, 1.2))
-        pyautogui.keyUp('w')
-        # 小幅转向：让覆盖范围扫过左右，不要原地转圈
-        _send_input_move(random.choice((-900, -450, 450, 900)), 0)
-        time.sleep(0.3)
-        # ⚠ 不再补按秘技（作者规则：只放一次）
-        # 顺带看一眼标识：有就直接开打
-        if step % 3 == 0 and enemy_indicator() is not None:
-            log('      · 看到敌人标识 → 提前开打')
-            if engage_battle(max_seconds=45):
-                return True
-    log('      · 秘技+前走 %.0fs 没进战斗' % max_seconds)
-    log('      !!! NEED_AUTHOR: 秘技已放完但没覆盖到怪（作者规则：这种情况直接找作者）')
-    return False
+            txt = '|'.join(_texts(ocr_items()))
+            if '选择祝福' in txt or '选择一项祝福' in txt:
+                pick_bless_inline()
+            # 打完之后门通常就开了
+            d2 = None
+            try:
+                d2 = find_door_by_tpl(min_score=0.55)
+            except Exception:
+                d2 = None
+            if d2 is None:
+                d2 = find_door_pink()
+            if d2 is not None:
+                off = d2['cx'] - 1920
+                if abs(off) > 140:
+                    mx = int(max(-300.0, min(300.0, off / TURN_K * TURN_DAMP)))
+                    if mx:
+                        _send_input_move(mx, 0)
+                        time.sleep(0.3)
+                log('      · 打完了，门出现了 → 直走')
+                pyautogui.keyDown('w')
+                time.sleep(1.8)
+                pyautogui.keyUp('w')
+                time.sleep(0.15)
+            continue
+
+        # 找敌人
+        enemy = None
+        try:
+            enemy = yolo_pick(CATE_ENEMY, min_conf=0.40, min_w=50)
+        except Exception:
+            enemy = None
+        if enemy is not None:
+            log('      · 找到敌人 %s %.2f 偏%+d → 对准撞上去'
+                % (enemy.get('label', '?'), enemy['conf'], enemy['cx'] - 1920))
+            if charge_enemy(enemy, max_seconds=14.0):
+                continue
+            scan += 1
+            continue
+
+        # 没找到 ⇒ 原地小步转（约 10°），不要大转
+        scan += 1
+        log('      · 没看到敌人（第%d次）→ 原地小步转 +600 找它' % scan)
+        _send_input_move(600, 0)
+        time.sleep(0.35)
+        if scan % 4 == 0:
+            # 每转 4 次（约 40°）往前走 1 秒，避免一直原地打转
+            pyautogui.keyDown('w')
+            time.sleep(1.0)
+            pyautogui.keyUp('w')
+            time.sleep(0.15)
+    return on_station_picker() or area_passed()
 
 
 def random_walk_rescan(tries=3):
@@ -2866,6 +3186,14 @@ def vlm_ask(prompt, width=VLM_WIDTH, num_predict=300, timeout=VLM_TIMEOUT):
 # ★ 抽奖机黑名单：某区域次数用完后，不再打开它（作者 2026-11-09 要求）
 _ROULETTE_DONE = {}
 
+# ★ 2026-11-09 作者第二张图：一个区域里可能有 **多个可交互物（B/D/F）**，
+#   必须**逐个交互完**门才会开 ⇒ 需要 OCR/VLM 来「定位」它们在左/中/右，
+#   然后一个个走过去交互。大体方向都在出生的正前方。
+INTERACT_LABELS = (
+    '造物调试台', '维护市容', '造物', '奇物', '事件', '宝藏', '宝箱',
+    '商店', '复活', '委托', '调查', '终端', '机关', '开关', '祭坛', '调试台',
+)
+
 
 def press_f_checked(targets=None, settle=0.7):
     """**按 F 之前先 OCR 交互提示，确认是我们要的目标**（作者 2026-11-09 要求）。
@@ -3099,6 +3427,164 @@ def progress_changed(before):
     return now != before
 
 
+def walk_lane_to_door(max_seconds=240, step=1.2):
+    """**一条直巷式推进**（★★ 作者 2026-11-09 画的俯瞰图，这就是本题的正确模型）：
+
+            C  = 门（区域出口）
+            |
+            B  = 怪物 / 可交互物（造物调试台、事件板…）
+            |
+            A  = 我们的角色（出生点）
+
+        作者原话：「其实你大方向往前走就可以了，中途要么打下怪物，
+                  要么交互，要么交互完绕过障碍。」
+
+    ⇒ 完全不需要 360° 扫描 / 全景 / VLM 指路。只需要：
+       1. **按住 W 往前走**；
+       2. 途中 **遇到怪 → 打它**（秘技 + 撞上去，打完继续）；
+       3. 途中 **遇到可交互 → OCR 看提示 → 按 F 交互**，交互完继续；
+       4. **撞墙/被挡 → 侧移（A/D）绕过去**，然后继续往前；
+       5. 门近了（模板命中且够大）→ 对准 → 走过去按 F。
+    返回 True = 出现选站点卡 / 区域已过。
+    """
+    t0 = time.time()
+    stuck = 0
+    stepn = 0
+
+    def _hold(keys, secs):
+        for k in keys.split():
+            pyautogui.keyDown(k)
+        time.sleep(secs)
+        for k in keys.split():
+            pyautogui.keyUp(k)
+        time.sleep(0.12)
+
+    def _frame_sig():
+        import cv2 as _cv
+        g = _cv.cvtColor(screenshot(), _cv.COLOR_BGR2GRAY)
+        return _cv.resize(g, (64, 36), interpolation=_cv.INTER_AREA).astype('float32')
+
+    log('      · 直巷推进开始（A→B→C，按住 W 一直向前）')
+    while time.time() - t0 < max_seconds:
+        check_pause('直巷推进')
+        stepn += 1
+
+        # ── 到站了？ ──
+        if on_station_picker() or area_passed():
+            log('      · ★ 到站（第%d步，%.0f 秒）' % (stepn, time.time() - t0))
+            return True
+
+        # ── 战斗中：等打完 ──
+        if in_battle():
+            log('      · 遇怪 → 等战斗结束')
+            wait_battle(timeout=420)
+            _txt = '|'.join(_texts(ocr_items()))
+            if '选择祝福' in _txt or '选择一项祝福' in _txt:
+                pick_bless_inline()
+            continue
+
+        # ── 事件界面：交互完继续 ──
+        _st = detect_state(verbose=False)[0]
+        if _st == 'event_dialog':
+            log('      · 遇事件 → 交互（A→B 的 B）')
+            do_event_dialog()
+            continue
+        if _st == 'roulette':
+            log('      · 遇抽奖机 → ESC 关掉继续走')
+            press('esc', 1.2)
+            time.sleep(0.8)
+            continue
+        if _st == 'popup_blank':
+            click_phys(1920, 1860, settle=1.0)
+            time.sleep(0.8)
+            continue
+        if _st in ('bless_choose', 'pick_miracle', 'device_curio'):
+            log('      · 面板(%s) → 点确定关掉' % _st)
+            if not click_text('确', tries=3, interval=0.8):
+                click_phys(3252, 1876, settle=1.0)
+            time.sleep(1.0)
+            continue
+
+        # ── 有交互提示 → OCR 校验后按 F ──
+        try:
+            _pr = find_prompts()
+        except Exception:
+            _pr = []
+        if _pr:
+            log('      · 看到提示「%s」→ 交互' % _pr[0][0])
+            if press_f_checked():
+                time.sleep(1.3)
+                continue
+
+        # ── 中间的可交互物（B/D/F）：先定位，再走过去交互 ──
+        _lab = None
+        try:
+            for _kw in INTERACT_LABELS:
+                _l = find_label(_kw)
+                if _l is not None:
+                    _lab = _l
+                    break
+        except Exception:
+            _lab = None
+        if _lab is not None:
+            _lx, _ly, _ltxt = _lab
+            _loff = _lx - 1920
+            if abs(_loff) > 160:
+                _mx2 = int(max(-260.0, min(260.0, _loff / 1.2)))
+                if _mx2:
+                    log('      · 定位到可交互「%s」偏%+d → 转%+d' % (_ltxt.strip(), _loff, _mx2))
+                    _send_input_move(_mx2, 0)
+                    time.sleep(0.3)
+                    continue
+            log('      · 可交互「%s」已对准 → 走过去' % _ltxt.strip())
+            _hold('w', 1.0)
+            continue
+
+        # ── 门够近 → 对准走过去 ──
+        _d = None
+        try:
+            _d = find_door_by_tpl(min_score=0.60)
+        except Exception:
+            _d = None
+        if _d is not None and _d['w'] >= 180:
+            _off = _d['cx'] - 1920
+            if abs(_off) > 150:
+                _mx = int(max(-260.0, min(260.0, _off / 1.2)))
+                if _mx:
+                    log('      · 门近了（偏%+d）→ 转%+d' % (_off, _mx))
+                    _send_input_move(_mx, 0)
+                    time.sleep(0.3)
+                    continue
+            log('      · 门正前方（宽%d）→ 交给闭环伺服' % _d['w'])
+            if approach_door_servo(max_seconds=45):
+                return True
+            continue
+
+        # ── 正常：往前走，检测有没有被挡住 ──
+        _a = _frame_sig()
+        _hold('w', step)
+        _b = _frame_sig()
+        try:
+            import numpy as _np
+            _diff = float(_np.abs(_a - _b).mean())
+        except Exception:
+            _diff = 99.0
+        if _diff < 2.5:
+            stuck += 1
+            _side = 'a' if stuck <= 3 else 'd'
+            log('      · 走不动（画面差 %.1f，第%d次）→ 侧移 %s 绕过障碍'
+                % (_diff, stuck, _side.upper()))
+            _hold(_side, 0.7)
+            if stuck >= 6:
+                log('      · 侧移 6 次仍被挡 → 再往前顶一次')
+                _hold('w a', 1.0)
+                stuck = 0
+        else:
+            stuck = 0
+    log('      · 直巷推进超时（%.0f 秒）' % max_seconds)
+    return on_station_picker() or area_passed()
+
+
 def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
     """清场 + 过门。返回 True = 已出现「选择下一站」。
 
@@ -3107,6 +3593,14 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
     t_all = time.time()
     _hud0 = hud_progress()          # ★ 本轮开始时的 HUD 进度号
     log('      · 起点进度号: %s' % (_hud0,))
+
+    # ★★★ 2026-11-09 作者俯瞰图：A(角色)→B(怪/可交互)→C(门) 一条直线 ⇒
+    #   **主策略就是"按住 W 一直往前走"** + 途中打怪/交互/绕障。
+    # ★ 240 秒太长（实测两次都是空走满 240 秒才交接，白耗 4 分钟）→ 收到 60 秒：
+    #   走过来只要 ~5 秒，60 秒还没到就说明方向不对，交给后面的扫描/兜底更快。
+    if walk_lane_to_door(max_seconds=60):
+        return True
+    log('      · 直巷推进没成 → 退回扫描式逻辑（兜底）')
     for t in range(1, tries + 1):
         log('      · 清场第 %d/%d 趟（直走 %ds）' % (t, tries, walk_seconds))
         # ★★ 2026-11-09 作者要求：**进区域先原地转一圈**；扫不到就不动（不乱走浪费）。
@@ -3147,7 +3641,8 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
                 # ★★ 2026-11-09：首扫命中门时**先用航位推算直走**（模板对角度敏感，
                 #   边转边重检测必丢；命中那一刻的方向最可信）。
                 _hd = hit['data']
-                if walk_deadreckon_to_door(_hd['cx'] - 1920, _hd['w']):
+                # ★ 首扫命中门 ⇒ 直接闭环伺服过去（开环盲走会擦肩而过）
+                if approach_door_servo(max_seconds=75):
                     return True
                 # 航位推算没成 → 再退回逐步对正（补足距离/角度偏差）
                 if approach_door(max_seconds=max(240, walk_seconds * 4)):
@@ -3947,7 +4442,28 @@ def main(argv=None):
                     help='跳过进场判断（假定已经在副本里，不做任何检测）')
     ap.add_argument('--force-entry', action='store_true',
                     help='强制走完整进场流程（默认是**自动判断**：已在局内就直接接着跑）')
+    ap.add_argument('--reset', action='store_true',
+                    help='先「暂离重进」回到区域出生点，再从头跑（用于复现/验证走位）')
     args = ap.parse_args(argv)
+    if args.reset and not args.dry:
+        # ★★ 2026-11-09 修：leave_and_rejoin 需要游戏窗口句柄 h。
+        #   之前漏传 → TypeError → 重置没生效 → 脚本从"门口"直接按 F 进门 ✗
+        log('==== --reset：先暂离重进，回到出生点 ====')
+        try:
+            _h = find_game()
+            if not _h:
+                log('  ! 找不到游戏窗口 → --reset 跳过（**这会导致从当前位置继续**）')
+            else:
+                ensure_foreground(_h)
+                time.sleep(0.8)
+                ok = leave_and_rejoin(_h)
+                log('  %s 暂离重进：%s' % ('✓' if ok else '✗', ok))
+                if not ok:
+                    log('  ! 重置失败 ⇒ 为避免"从门口直接进门"，这里**直接退出**，请手动暂离重进后重跑')
+                    return 3
+        except Exception as e:
+            log('  ! 暂离重进出错: %s ⇒ 退出（不继续跑）' % e)
+            return 3
     return run(max_areas=args.areas, dry=args.dry, skip_entry=args.skip_entry,
                force_entry=args.force_entry)
 
