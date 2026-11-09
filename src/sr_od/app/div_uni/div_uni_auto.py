@@ -677,6 +677,9 @@ STATE_RULES = [
     ('settle',         ['结束并结算', '探索成功']),
     ('bless_choose',   ['选择祝福', '选择一项祝福']),
     ('event_dialog',   ['获得', '确定']),
+    # ★ 2026-11-09：**奇物大转盘**（开门/事件后弹出的抽奖机）——
+    #   实测脚本不认识它，会一直停在这个界面 ✗
+    ('roulette',       ['奇物大转盘', '开始抽奖', '剩余次数']),
     ('in_area',        ['差分宇宙', '位面']),
     ('main_menu',      ['开始游戏', '乐园漫记']),
     ('mode_select',    ['常规演算', '周期演算']),
@@ -839,6 +842,22 @@ def is_world(items=None):
     items = items if items is not None else ocr_items()
     txt = '|'.join(_texts(items))
     return ('位面' in txt) or ('状态效果' in txt)
+
+
+def roulette_topleft():
+    """左上角 OCR 判「奇物大转盘」（作者 2026-11-09 建议：左上角识别最稳）。
+
+    实测该界面左上角直接写「奇物大转盘」（置信度 1.0），
+    而区域里左上角是「(n/13) 位面-XX」。
+    """
+    try:
+        import cv2
+        img = screenshot()
+        crop = cv2.resize(img[0:300, 0:950], None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        txt = ''.join(t.strip() for t, s, _, _ in ocr_items(crop) if s >= 0.35)
+        return '转盘' in txt
+    except Exception:
+        return False
 
 
 def event_ui_topleft():
@@ -1491,7 +1510,10 @@ def find_pink_in_canvas(canvas):
         # ★★ 2026-11-09 实测：全景里曾选中「白0.51 黄0.00」的**纯白物体**当门，
         #   转过去后卡住不动 ✗。真门在截图里是「白0.24 黄0.014」。
         #   判据：有黄框（≥0.01）或 白色适中（0.10~0.35）；纯白 >0.35 一律不要。
-        if not (yf >= 0.01 or (0.10 <= wf <= 0.35)):
+        # ★★ 2026-11-09 数据定案：**只认黄框，不要"纯白也算"**。
+        #   实测真门 黄框 0.014~0.16；而店铺门面/警戒带 黄框 0.00、白色 0.3~0.8
+        #   ⇒ 之前"白色 0.10~0.35 也算门"把店招选成门，转过去全是店 ✗
+        if yf < 0.012:
             continue
         out.append({'x': int(x + w // 2), 'w': int(w), 'h': int(hh), 'white': wf, 'yellow': yf,
                     'score': yf * 20 + wf * 8 + min(area, 8000) / 8000.0})
@@ -2007,20 +2029,38 @@ def approach_door(max_seconds=60, center_tol=120):
     # ★ 作者要求：**丢了目标就用全景**；这里 sweep=0 关掉"小幅度扫描"（它救不回来）
     if not turn_to_center_of(lambda: pick_door(min_score=0.55), name='门',
                              tol=tol, max_iter=12, sweep=0):
+        # ★★ 2026-11-09：粉色检测在本区**极不稳定**（假阳性满天飞），
+        #   所以"丢失目标"后**先让 VLM 指方向**（它擅长"有没有门/左中右"），
+        #   再退到全景。
+        log('      · 门没对上（丢失目标）→ 先让 VLM 指路')
+        if walk_by_vlm(max_seconds=80):
+            log('      · ✓ VLM 指路成功')
+            return True
+        log('      · VLM 指路没成 → 全景兜底')
         log('      · 门没对上（丢失目标）→ 全景扫一次（计数 +1）')
         r = pano_once('丢失目标')
         if r is None:
             return False
         if r:
-            return True
+            # 同样要硬校验：全景"成功"也不等于过门
+            if on_station_picker() or area_passed():
+                return True
+            log('      · 全景后仍未出现选站点卡 → 继续本轮')
         # ★ 2026-11-09 作者指定：全景也找不到 ⇒ **随机走+重扫**，三次都不行才重置位置。
         log('      · 全景没找到目标 → 兜底②：随机走+重扫（最多 3 次）')
-        if random_walk_rescan(tries=3):
+        _before = hud_progress()        # ★ 局部变量（这里在 approach_door 里，不能用 clear_area 的 _hud0）
+        random_walk_rescan(tries=3)
+        # 硬校验：随机走"找到东西"不等于过门，必须选站点卡出现或进度号变了
+        if on_station_picker() or area_passed() or (hud_progress() not in (None, _before)):
+            log('      · ✓ 已推进（进度号 %s → %s）' % (_before, hud_progress()))
             return True
+        log('      · 随机走后仍未推进（进度号仍是 %s）' % (hud_progress(),))
+        return False
         log('      · 兜底②未找到 → 兜底③：覆盖推进')
         return coverage_clear(max_seconds=min(70.0, max_seconds))
 
-    for seg in range(12):
+    # ★ 段数 12 -> 30：0.55s/段，最多约 16 秒步行（对 10 米外的门够用）
+    for seg in range(30):
         check_pause('过门')
         if time.time() - t0 > max_seconds:
             break
@@ -2709,7 +2749,143 @@ def vlm_ask(prompt, width=VLM_WIDTH, num_predict=300, timeout=VLM_TIMEOUT):
         return None
 
 
-def scan_in_place(max_steps=14, step_mouse=600):
+def find_label(keyword, min_score=0.45):
+    """在屏幕上找**世界标签**（物体上方的文字，如「造物调试台」「维护市容」）。
+
+    返回 (x, y, text) 或 None。标签的 x 就是物体的方向 ✓
+    """
+    try:
+        for t, s, cx, cy in ocr_items():
+            if s >= min_score and keyword in t:
+                return int(cx), int(cy), t.strip()
+    except Exception:
+        pass
+    return None
+
+
+def walk_to_label(keyword, max_seconds=45, tol=150):
+    """**走到屏幕上某个世界标签并交互**（按 F）。
+
+    作者 2026-11-09 指出的通用办法：世界标签的位置跟随物体 ⇒ 标签的 x 就是方向。
+    用法：铸造区的「造物调试台」、事件板、复活装置等。
+    返回 True = 已经交互（按了 F 且有界面变化）；False = 没找到/没成功。
+    """
+    t0 = time.time()
+    hit_any = False
+    while time.time() - t0 < max_seconds:
+        if on_station_picker() or area_passed():
+            return True
+        lab = find_label(keyword)
+        if lab is None:
+            if hit_any:
+                return False
+            # 没看到标签：原地转一点点再找（不要大范围乱转）
+            _send_input_move(500, 0)
+            time.sleep(0.35)
+            continue
+        hit_any = True
+        x, y, txt = lab
+        off = x - 1920
+        log('      · 看到标签「%s」偏%+d' % (txt, off))
+        if abs(off) > tol:
+            mx = int(max(-260.0, min(260.0, off / TURN_K * TURN_DAMP)))
+            if mx == 0:
+                mx = 1 if off > 0 else -1
+            _send_input_move(mx, 0)
+            time.sleep(0.35)
+            continue
+        # 已对正 → 走过去 + 按 F
+        pyautogui.keyDown('w')
+        time.sleep(0.8)
+        pyautogui.keyUp('w')
+        time.sleep(0.3)
+        press('f', 0.9)
+        time.sleep(0.8)
+        # 交互成功通常会出现界面变化（弹窗/面板）
+        st = detect_state(verbose=False)[0]
+        if st in ('device_curio', 'event_dialog', 'popup_blank', 'bless_choose'):
+            log('      · 交互后进入界面: %s' % st)
+            return True
+    return False
+
+
+def vlm_locate_door(max_tries=6):
+    """**让 VLM 指方向**：它说不出像素坐标，但能可靠说出"有没有门、在左/中/右"。
+
+    返回 'left' / 'center' / 'right' / None（没有门或判断失败）。
+    """
+    ans = vlm_ask('这是《崩坏：星穹铁道》差分宇宙的区域画面。'
+                  '画面里有没有一扇**粉色的门**（门框是黄/金色的）？'
+                  '只回答：没有 / 左边 / 中间 / 右边。')
+    if not ans:
+        return None
+    a = ans.replace(' ', '')
+    if '没有' in a or '看不到' in a or '不存在' in a:
+        return None
+    # 先判左右，再判中间（避免"中间偏左"这类混合说法）
+    if '左边' in a or '左侧' in a or '左' in a:
+        return 'left'
+    if '右边' in a or '右侧' in a or '右' in a:
+        return 'right'
+    if '中间' in a or '中央' in a or '正中' in a:
+        return 'center'
+    return None
+
+
+def walk_by_vlm(max_seconds=100):
+    """**用 VLM 指方向来走到门口**（作者建议的分层：VLM 做决策，cv2 做动作）。
+
+    每次问一句（2~4 秒）：
+      * 没有门 → 原地转 ~90° 再看
+      * 左边/右边 → 转过去
+      * 中间 → 往前走 + 按 F
+    出现选站点卡即成功。
+    """
+    t0 = time.time()
+    turn_cycle = 0
+    while time.time() - t0 < max_seconds:
+        if on_station_picker() or area_passed():
+            return True
+        if in_battle():
+            wait_battle(timeout=420)
+            return True
+        where = vlm_locate_door()
+        if where is None:
+            turn_cycle += 1
+            log('      · VLM: 这个方向没看到门 → 转 90° 再看（第%d次）' % turn_cycle)
+            if turn_cycle > 5:
+                log('      · VLM 转满一圈都没门 → 放弃')
+                return False
+            _send_input_move(2900, 0)
+            time.sleep(0.6)
+            continue
+        turn_cycle = 0
+        if where == 'left':
+            log('      · VLM: 门在左边 → 左转')
+            _send_input_move(-900, 0)
+            time.sleep(0.4)
+            continue
+        if where == 'right':
+            log('      · VLM: 门在右边 → 右转')
+            _send_input_move(900, 0)
+            time.sleep(0.4)
+            continue
+        log('      · VLM: 门在中间 → 往前走 + 按 F')
+        pyautogui.keyDown('w')
+        time.sleep(0.9)
+        pyautogui.keyUp('w')
+        time.sleep(0.25)
+        press('f', 0.7)
+        if on_station_picker() or area_passed():
+            return True
+    return False
+
+
+def scan_in_place(max_steps=40, step_mouse=620):
+    # ★★ 2026-11-09 关键修复：原来 14 步 × 600 = 8400 鼠标 ≈ **137°**，根本不是"一圈"！
+    #   而**门常常就在出生点正后方**（重置后截图里门就在角色背后）
+    #   ⇒ 只转 137° 永远看不到它 ✗
+    #   现在 40 × 620 = 24800 鼠标 ≈ 400°（一屏≈3800 鼠标≈62°），真正覆盖整圈 ✓
     """**原地转一圈扫描**（作者 2026-11-09 要求）：
 
         「进入区域的第一次扫描如果没扫到东西就不要动，免得乱动浪费时间，
@@ -2741,9 +2917,35 @@ def scan_in_place(max_steps=14, step_mouse=600):
         except Exception as e:
             log('        ! 扫描异常: %s' % e)
         _send_input_move(step_mouse, 0)
-        time.sleep(0.25)
+        time.sleep(0.2)
     log('      · 原地一圈没有扫到任何目标 → **改用全景扫描**（作者 2026-11-09：丢了目标就用全景，小幅度扫描没用）')
     return None
+
+
+def hud_progress():
+    """读左上角 HUD 的 **(n/13)** 进度号（作者 2026-11-09 建议：这个最稳健）。
+
+    返回 (n, m) 或 None。判"有没有推进"就看这个数字变没变，
+    比"有没有出现选站点卡"可靠得多（后者会被误判成 True）。
+    """
+    try:
+        import cv2
+        import re as _re
+        img = screenshot()
+        crop = cv2.resize(img[15:145, 110:1150], None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        txt = ''.join(t.strip() for t, s, _, _ in ocr_items(crop) if s >= 0.4)
+        mm = _re.search(r'(\d+)\s*/\s*(\d+)', txt)
+        return (int(mm.group(1)), int(mm.group(2))) if mm else None
+    except Exception:
+        return None
+
+
+def progress_changed(before):
+    """HUD 进度号是否相对 before 变了（变了 = 真的推进了）。"""
+    now = hud_progress()
+    if before is None or now is None:
+        return None
+    return now != before
 
 
 def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
@@ -2752,6 +2954,8 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
     最坏耗时 ≈ walk_seconds 两次 + roam_seconds 一次 ≈ 3 分钟，之后重置位置。
     """
     t_all = time.time()
+    _hud0 = hud_progress()          # ★ 本轮开始时的 HUD 进度号
+    log('      · 起点进度号: %s' % (_hud0,))
     for t in range(1, tries + 1):
         log('      · 清场第 %d/%d 趟（直走 %ds）' % (t, tries, walk_seconds))
         # ★★ 2026-11-09 作者要求：**进区域先原地转一圈**；扫不到就不动（不乱走浪费）。
@@ -2759,6 +2963,11 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
             hit = scan_in_place()
             if hit is None:
                 # ★ 作者要求：**目标丢失 = 用全景扫描**（不要小幅度扫、不要覆盖推进）
+                log('      · 首扫无目标 → 先让 VLM 指路')
+                if walk_by_vlm(max_seconds=90):
+                    log('      · ✓ VLM 指路成功')
+                    return True
+                log('      · VLM 指路没成 → 全景兜底')
                 log('      · 首扫无目标 → 全景扫一次（计数 +1）')
                 r = pano_once('初始扫描')
                 if r is None:
@@ -2784,10 +2993,16 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
                     return True
                 log('      · 提示「%s」交互后未出站点卡，继续常规流程' % _w)
             elif hit['kind'] == 'door':
-                if approach_door(max_seconds=max(20, walk_seconds // 2)):
+                # ★★ 预算给足：对正本身就要 20~30 秒（每步 3 次检测），
+                #   原 walk_seconds//2=30 秒会被对正吃光，导致"只走 1 段就放弃" ✗
+                if approach_door(max_seconds=max(90, walk_seconds * 2)):
                     return True
                 # ★ 作者要求：首扫看到门但对不上/进不去 ⇒ **本轮到此为止**，
                 #   不要接着覆盖推进（点地面乱走最浪费时间）
+                # ★ 先试试本区的「造物调试台」（铸造区固定有这台设备）
+                if walk_to_label('造物调试台', max_seconds=35):
+                    log('      · 造物调试台已交互（加权奇物面板会由状态机处理）')
+                    return True
                 # ★ 走+F 没成功：用 VLM 判一下门是睁眼还是闭眼（1~4 秒）
                 _eyes = vlm_door_eyes(hit['data'])
                 if _eyes == 'closed':
@@ -2815,7 +3030,8 @@ def clear_area(h=None, tries=3, walk_seconds=60, roam_seconds=90):
         if not leave_and_rejoin(h):
             log('      ⚠ 暂离/重进失败')
             break
-    log('      · 清场总共 %.0f 秒仍没开出门' % (time.time() - t_all))
+    log('      · 清场总共 %.0f 秒仍没开出门（进度号 %s → %s）'
+        % (time.time() - t_all, _hud0, hud_progress()))
     if is_final_area():
         log('      · 这是最终区（13/13）→ 用「结束并结算」收尾')
         settle_exit()
@@ -3393,6 +3609,46 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
             log('     需要人工点一下才能继续；代码层面没有可靠的办法绕过 ✗')
             return 5
 
+        if state == 'roulette':
+            # ★★ 2026-11-09 实测：**「剩余次数：0」时点「开始抽奖」毫无反应**，
+            #   之前脚本就在这儿空点到卡死。次数为 0 要**直接关面板**。
+            _rt = '|'.join(_texts(ocr_items()))
+            if ('剩余次数：0' in _rt) or ('剩余次数:0' in _rt):
+                log('      · 奇物大转盘：剩余次数 0 → 按 ESC 退出（不行就点右上角 X）')
+                press('esc', 1.5)
+                time.sleep(1.2)
+                if roulette_topleft():
+                    log('        · ESC 没退掉 → 点右上角 X (3744,129)')
+                    click_phys(3744, 129, settle=1.2)
+                    time.sleep(1.2)
+                if roulette_topleft():
+                    log('        · 还是转盘 → 再按一次 ESC')
+                    press('esc', 1.5)
+                    time.sleep(1.0)
+                continue
+            log('      · 奇物大转盘 → 点「开始抽奖」')
+            g = ocr_find('开始抽奖', tries=4, interval=1.0)
+            if g:
+                click_phys(g[0], g[1], settle=1.5)
+                time.sleep(4.0)          # 等转盘转完
+                # 抽完通常会弹结果/确认
+                for _ in range(4):
+                    if not roulette_topleft():
+                        log('        · 转盘已关闭')
+                        break
+                    gg = ocr_find('确定', tries=1) or ocr_find('确认', tries=1) or ocr_find('关闭', tries=1)
+                    if gg:
+                        log('        · 点 %s' % (gg,))
+                        click_phys(gg[0], gg[1], settle=1.2)
+                    else:
+                        log('        · 按 ESC 退出转盘')
+                        press('esc', 1.2)
+                    time.sleep(1.2)
+            else:
+                log('      · 没找到「开始抽奖」→ 点空白关闭')
+                click_phys(1920, 1860, settle=1.0)
+            time.sleep(1.5)
+            continue
         if state == 'device_curio':
             log('      · 造物调试台（选择加权奇物）→ 点右上 X 关闭')
             click_phys(3744, 129, settle=1.2)
