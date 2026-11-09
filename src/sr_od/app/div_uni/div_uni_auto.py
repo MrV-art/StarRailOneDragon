@@ -1573,7 +1573,9 @@ def goto_by_panorama(n=40, step=500, max_iter=12):
 # 门模板集合：每个区域的门样式不同，**一套模板不够**。
 # 2026-11-08 实测：door9（财富区裁的）在铸造区只有 0.32 不达标；
 # 而 door_casting（铸造区四方向图里裁的，190×268）自匹配 1.000 ✓。
-DOOR_TEMPLATES = ('door9.png', 'door_casting.png')
+DOOR_TEMPLATES = ('door9.png', 'door_casting.png', 'door_wealth.png')
+# 2026-11-09 新增 door_wealth.png：从「财富」区实拍裁的（粉门+两只白眼+黄框窗），自匹配 1.000。
+# 这区的品红广告牌/海报和门颜色几乎一样，**只能靠模板区分** ✓
 
 
 def find_door_by_tpl(min_score=0.55, near=520):
@@ -1723,18 +1725,19 @@ def pick_door(min_score=0.60, tol_near=420):
         _DOOR_LAST['miss'] = 0
         return d
 
-    # ★★ 2026-11-08 晚定案：**颜色+黄框优先于模板**。
-    # 实测铸造区：door9 0.32@偏+556、door_casting 0.41@偏-452（都指错），
-    # 而"品红+黄框≥0.02"稳定命中真门（偏-20，连续 3 帧不变）✓
-    _pk = find_door_pink()
-    if _pk is not None:
-        _d = _accept(_pk)
-        if _d is not None:
-            return _d
-
+    # ★★ 2026-11-09 再次调整：**模板优先**。
+    #   原因：财富区的**品红广告牌/海报**在颜色上与门几乎一样（都品红+黄框），
+    #   颜色判据必然误检；而 door_wealth.png 自匹配 1.000、在场景里 0.6+，
+    #   模板能把门和海报干净分开 ✓
     _td = find_door_by_tpl(min_score=0.55)
     if _td is not None:
         _d = _accept(_td)
+        if _d is not None:
+            return _d
+
+    _pk = find_door_pink()
+    if _pk is not None:
+        _d = _accept(_pk)
         if _d is not None:
             return _d
 
