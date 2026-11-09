@@ -1453,8 +1453,13 @@ def find_pink_in_canvas(canvas):
         rh = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         wf = float(cv2.inRange(rh, (0, 0, 180), (180, 80, 255)).mean()) / 255.0
         yf = float(cv2.inRange(rh, (15, 90, 150), (40, 255, 255)).mean()) / 255.0
+        # ★★ 2026-11-09 实测：全景里曾选中「白0.51 黄0.00」的**纯白物体**当门，
+        #   转过去后卡住不动 ✗。真门在截图里是「白0.24 黄0.014」。
+        #   判据：有黄框（≥0.01）或 白色适中（0.10~0.35）；纯白 >0.35 一律不要。
+        if not (yf >= 0.01 or (0.10 <= wf <= 0.35)):
+            continue
         out.append({'x': int(x + w // 2), 'w': int(w), 'h': int(hh), 'white': wf, 'yellow': yf,
-                    'score': wf * 4 + yf * 2 + min(area, 8000) / 8000.0})
+                    'score': yf * 20 + wf * 8 + min(area, 8000) / 8000.0})
     out.sort(key=lambda c: -c['score'])
     return out
 
@@ -1920,13 +1925,19 @@ def approach_door(max_seconds=60, center_tol=120):
     t0 = time.time()
     last_w = None
     stall = 0
+    _last_off = None
+    _jumps = 0
     tol = max(100, int(center_tol * 0.8))   # 模板抖动约 ±60，容差必须更宽
     if not turn_to_center_of(lambda: pick_door(min_score=0.42), name='门',
                              tol=tol, max_iter=12, sweep=140):
         log('      · 门没对上 → 兜底①：全景闭环')
         if goto_by_panorama():
             return True
-        log('      · 全景兜底也没成 → 兜底②：覆盖推进')
+        # ★ 2026-11-09 作者指定：全景也找不到 ⇒ **随机走+重扫**，三次都不行才重置位置。
+        log('      · 全景没找到目标 → 兜底②：随机走+重扫（最多 3 次）')
+        if random_walk_rescan(tries=3):
+            return True
+        log('      · 兜底②未找到 → 兜底③：覆盖推进')
         return coverage_clear(max_seconds=min(70.0, max_seconds))
 
     for seg in range(12):
@@ -1974,6 +1985,17 @@ def approach_door(max_seconds=60, center_tol=120):
             else:
                 stall = 0
             last_w = d['w']
+            # ★★ 2026-11-09：**门偏剧烈跳变 = 检测器在乱抓**（战斗区满地气球/装饰），
+            #   实测 +822→+360→+1653→+1788→… 来回跳，白烧 15~30 秒/轮 ✗
+            #   连续 3 次跳变 >900px 就判定"这不是稳定门"，尽快把控制权交回漫游/全景。
+            if _last_off is not None and abs(off - _last_off) > 900:
+                _jumps += 1
+                if _jumps >= 3:
+                    log('      · 门偏连续跳变 %d 次（%+d→%+d）⇒ 判定检测不稳，放弃对齐' % (_jumps, _last_off, off))
+                    return False
+            else:
+                _jumps = 0
+            _last_off = off
             if abs(off) > tol:
                 mx = max(-300.0, min(300.0, off / TURN_K * TURN_DAMP))
                 _send_input_move(int(mx), 0)
@@ -1981,6 +2003,52 @@ def approach_door(max_seconds=60, center_tol=120):
         else:
             log('      · 段%d 门不可见（可能已贴近）' % (seg + 1))
     return on_station_picker() or area_passed()
+
+
+def random_walk_rescan(tries=3):
+    """全景扫描找不到目标时的自救（**作者 2026-11-09 指定**）：
+
+        随机方向走随机距离 → 再扫一遍 → 三次都扫不到 ⇒ 重置位置（暂离重进）。
+
+    理由（作者原话）：这样比在原地反复扫/反复转更省时间。
+    返回 True = 已找到目标或已重置位置（可以继续下一趟）。
+    """
+    import random
+    for i in range(tries):
+        mx = random.randint(-3200, 3200)
+        _send_input_move(mx, 0)
+        time.sleep(0.45)
+        secs = random.uniform(0.7, 2.0)
+        pyautogui.keyDown('w')
+        time.sleep(secs)
+        pyautogui.keyUp('w')
+        time.sleep(0.5)
+        log('      · 随机走（转%+d，走%.1fs）第 %d/%d 次 → 重新扫描' % (mx, secs, i + 1, tries))
+        # 重新扫描：门（颜色/模板/YOLO）或敌人标识都算"找到目标"
+        if find_door_pink() is not None:
+            log('        ✓ 扫到粉门'); return True
+        if find_door_by_tpl(min_score=0.42) is not None:
+            log('        ✓ 扫到门模板'); return True
+        if enemy_indicator() is not None:
+            log('        ✓ 扫到敌人标识 → 开打'); engage_battle()
+            return True
+        if yolo_pick(CATE_ENEMY, min_conf=0.45, min_w=60) is not None:
+            log('        ✓ YOLO 扫到怪'); return True
+        # 再来一次全景闭环（它内部会横扫 360°）
+        try:
+            if goto_by_panorama():
+                log('        ✓ 全景闭环成功')
+                return True
+        except Exception as e:
+            log('        ✗ 全景异常: %s' % e)
+    log('      · 三次都扫不到目标 → 重置位置（暂离重进）')
+    h = find_game()
+    if h:
+        try:
+            leave_and_rejoin(h)
+        except Exception as e:
+            log('        ✗ 重置异常: %s' % e)
+    return True
 
 
 def advance_and_clear(max_seconds=60):
@@ -2709,6 +2777,17 @@ def run(max_areas=14, dry=False, skip_entry=False, force_entry=False):
             _same += 1
         else:
             _last_sig, _same = _sig, 1
+        # ★ 2026-11-09 作者要求：**卡住时用全景闭环自救**，别直接判死退出。
+        if _same == 8:
+            log('  ⚠ 界面「%s」连续 8 轮没变化 → 先试全景闭环找路（作者指定的自救手段）' % state)
+            try:
+                if goto_by_panorama():
+                    log('      ✓ 全景闭环返回成功')
+                    _same = 0
+                    _last_sig = None
+                    continue
+            except Exception as e:
+                log('      ✗ 全景闭环异常: %s' % e)
         if _same >= 12:
             log('  ⚠ 界面「%s」连续 %d 轮没有任何变化 → 判定卡死，退出（返回 5）' % (state, _same))
             log('     已知成因：某些界面**完全不吃合成输入**（键盘/鼠标/SendInput/消息全无效），')
