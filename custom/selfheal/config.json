@@ -1,0 +1,8 @@
+{
+  "_说明": "失败自愈取证开关。enabled=true 才会在应用失败时生成取证包；默认 false=完全不影响一条龙。",
+  "enabled": false,
+  "max_per_hour": 1,
+  "keep_days": 14,
+  "log_tail_lines": 120,
+  "shot": true
+}
