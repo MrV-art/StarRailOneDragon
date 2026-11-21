@@ -54,3 +54,7 @@ models/
 
 # 2026-11-09 脚本改动用 .bak-<时间戳> 备份，不进版本库
 *.bak-*
+# 2026-11-22：自愈功能的运行报告不进库（只有 config.json / README.md 值得留）
+custom/selfheal/reports/
+# 另一种备份命名（.bak2-<时间戳>），与 *.bak-* 同类
+*.bak2-*

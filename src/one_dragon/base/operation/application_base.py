@@ -86,6 +86,14 @@ class Application(Operation):
         Operation.after_operation_done(self, result)
         self._update_record_after_stop(result)
 
+        # ★ 失败自愈取证（2026-11-07 加）：默认关闭，只写文件、永不抛异常 ✓
+        #   关闭：删掉这几行，或把 custom/selfheal/config.json 的 enabled 设为 false ✓
+        try:
+            from one_dragon.base.operation.self_heal import capture_if_failed
+            capture_if_failed(self, result)
+        except Exception:
+            pass
+
         if self.ctx.run_context.is_app_need_notify(self.app_id):
             send_application_notify(self, result.success)
             # 清空通知池

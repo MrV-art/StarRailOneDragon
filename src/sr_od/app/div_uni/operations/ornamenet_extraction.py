@@ -179,8 +179,19 @@ class ChallengeOrnamentExtraction(SrOperation):
         :return:
         """
         screen = self.last_screenshot
-        return self.round_by_find_and_click_area(screen, '饰品提取', '按钮-开始挑战',
-                                                 success_wait=2, retry_wait=1)
+        # 2026-11-02：**加了点击次数上限** ✗ —— round_wait 不计入重试次数，
+        # 只靠 until_not_find_all 会在"背包满等外部原因"下无限点击 ✗。
+        self._challenge_clicks = getattr(self, '_challenge_clicks', 0) + 1
+        if self._challenge_clicks > 6:
+            return self.round_fail('点击挑战 6 次仍未进入副本（可能背包满/游戏提示阻挡）')
+        # 原实现点一次就往下走 → 后面等 17 秒「角色图标」必然超时 ✗。
+        # 改成 until_not_find_all：点完下一轮**先检查「开始挑战」是否已消失** ✓，
+        # 没消失就**再点一次** ✓，直到进入副本（按钮消失）才判成功 ✓。
+        return self.round_by_find_and_click_area(
+            screen, '饰品提取', '按钮-开始挑战',
+            success_wait=2, retry_wait=1,
+            until_not_find_all=[('饰品提取', '按钮-开始挑战')],
+        )
 
     @node_from(from_name='点击挑战')
     @operation_node(name='等待副本加载', node_max_retry_times=20)

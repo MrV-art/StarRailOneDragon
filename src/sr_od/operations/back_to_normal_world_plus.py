@@ -16,6 +16,13 @@ from sr_od.screen_state import common_screen_state
 
 class BackToNormalWorldPlus(SrOperation):
 
+    # ★ 2026-11-09（作者要求）：兜底「点右上角返回」最多**连续**点这么多次。
+    #   以前是**无限点** ✗ —— round_wait 返回 WAIT，operation.py 对 WAIT 直接 continue、
+    #   还会把 node_retry_times 归零（见 operation.py:453-464），所以 node_max_retry_times=20
+    #   根本兜不住；只要画面认不出来，它就会每 2.4 秒点一次「右上角返回」永不退出 ✗。
+    #   2026-11-09 04:05 星铁接到昨晚遗留的游戏进程，就这样刷了 711 秒、整轮拖死 ✗。
+    FALLBACK_CLICK_LIMIT = 15
+
     def __init__(self, ctx: SrContext):
         """
         返回普通大世界 增强版
@@ -24,10 +31,17 @@ class BackToNormalWorldPlus(SrOperation):
         :param ctx:
         """
         SrOperation.__init__(self, ctx, op_name=gt('返回普通大世界'))
+        self._fallback_clicks = 0        # 连续走「点右上角返回」兜底的次数
+        self._last_was_fallback = False  # 上一轮是不是走了兜底（用来判断"连续"）
 
     @operation_node(name='画面识别', node_max_retry_times=20, is_start_node=True)
     def check_screen(self) -> OperationRoundResult:
         screen = self.last_screenshot
+
+        # 上一轮不是兜底 → 说明画面被认出来了，连续计数清零 ✓
+        if not self._last_was_fallback:
+            self._fallback_clicks = 0
+        self._last_was_fallback = False
 
         # 先看看左上角是否退出按钮
         result = self.round_by_find_area(screen, '模拟宇宙', '大世界返回按钮')
@@ -137,6 +151,26 @@ class BackToNormalWorldPlus(SrOperation):
             return self.round_wait(result.status, wait=2)
 
         # 其他情况 - 均点击右上角触发返回上一级
+        # ★ 2026-11-09 加限：认不出的画面不再无限点（见 FALLBACK_CLICK_LIMIT 注释）；
+        #   超限时**存一张截图**（以前只有被杀掉之后的黑屏图，取不到卡住时的原文画面 ✗）
+        self._fallback_clicks += 1
+        self._last_was_fallback = True
+        if self._fallback_clicks > self.FALLBACK_CLICK_LIMIT:
+            try:
+                file_name = self.save_screenshot(prefix='BackToNormalWorldPlus_stuck')
+            except Exception:
+                file_name = '（截图保存失败）'
+            return self.round_fail(
+                f'连续 {self._fallback_clicks - 1} 次点「右上角返回」都没离开当前画面'
+                f'（截图 {file_name}）')
+        # ★ 2026-11-13：星铁 4.7 的「无名勋礼·开启无名勋礼」全屏页**没有**右上角返回按钮 ✗，
+        #   只吃 ESC → 兜底里每 3 次插一次 ESC（否则只会傻点十几次右上角、把后面的「每日实训」也拖死 ✗）
+        if self._fallback_clicks % 3 == 0:
+            try:
+                self.ctx.controller.btn_tap('escape')
+            except Exception:
+                pass
+            return self.round_wait('按 ESC 尝试退出当前页面', wait=1)
         result = self.round_by_click_area('菜单', '右上角返回')
         return self.round_wait(result.status, wait=1)
 
