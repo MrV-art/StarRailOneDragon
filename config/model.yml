@@ -1,3 +1,3 @@
-ocr_gpu: true
-world_patrol_gpu: true
-sim_uni_gpu: true
+ocr_gpu: false
+world_patrol_gpu: false
+sim_uni_gpu: false
